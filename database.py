@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
@@ -148,6 +149,7 @@ CREATE TABLE IF NOT EXISTS risk_state (
     circuit_state        TEXT    NOT NULL DEFAULT 'OK',
     circuit_reason       TEXT    NOT NULL DEFAULT '',
     halt_until           REAL,
+    paused               INTEGER NOT NULL DEFAULT 0,
     updated_at           INTEGER NOT NULL DEFAULT 0
 );
 
@@ -195,6 +197,13 @@ class Database:
             await self._db.execute(
                 "INSERT OR IGNORE INTO risk_state (id) VALUES (1)"
             )
+        # Live migrations: add columns that may not exist in older DBs
+        try:
+            await self._db.execute(  # type: ignore
+                "ALTER TABLE risk_state ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # Column already exists — fine
 
     # ─── Candles ─────────────────────────────────────────────
 
@@ -335,7 +344,7 @@ class Database:
                (id, position_id, symbol, strategy, direction, entry_price, exit_price,
                 size, pnl, exit_reason, duration_seconds, r_multiple, confidence, timestamp)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(tr.timestamp.timestamp()), tr.position_id, tr.symbol, tr.strategy,
+            (str(uuid.uuid4()), tr.position_id, tr.symbol, tr.strategy,
              tr.direction, tr.entry_price, tr.exit_price, tr.size, tr.pnl,
              tr.exit_reason, tr.duration_seconds, tr.r_multiple, tr.confidence, _ts()),
         )
@@ -370,12 +379,12 @@ class Database:
                (id, balance, peak_balance, total_pnl, gross_profit, gross_loss,
                 total_trades, winning_trades, losing_trades, consecutive_losses,
                 consecutive_wins, total_signals, daily_pnl, daily_start_balance,
-                circuit_state, circuit_reason, halt_until, updated_at)
-               VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                circuit_state, circuit_reason, halt_until, paused, updated_at)
+               VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (m.balance, m.peak_balance, m.total_pnl, m.gross_profit, m.gross_loss,
              m.total_trades, m.winning_trades, m.losing_trades, m.consecutive_losses,
              m.consecutive_wins, m.total_signals, m.daily_pnl, m.daily_start_balance,
-             m.circuit_state, m.circuit_reason, m.halt_until, _ts()),
+             m.circuit_state, m.circuit_reason, m.halt_until, int(m.paused), _ts()),
         )
         await self._db.commit()  # type: ignore
 
@@ -402,12 +411,17 @@ class Database:
 
     async def cleanup_old_data(self, days: int = 30) -> None:
         cutoff = _ts() - days * 86_400_000
-        for table in ("candles", "signals", "error_log"):
-            await self._db.execute(  # type: ignore
-                f"DELETE FROM {table} WHERE recorded_at < ? OR timestamp < ?",
-                (cutoff, cutoff),
-            )
-        # OI: keep last 5000 rows per symbol
+        # Each table uses its actual timestamp column name
+        await self._db.execute(  # type: ignore
+            "DELETE FROM candles WHERE open_time < ?", (cutoff,)
+        )
+        await self._db.execute(  # type: ignore
+            "DELETE FROM signals WHERE timestamp < ?", (cutoff,)
+        )
+        await self._db.execute(  # type: ignore
+            "DELETE FROM error_log WHERE recorded_at < ?", (cutoff,)
+        )
+        # OI: keep last 50000 rows per symbol
         await self._db.execute(  # type: ignore
             """DELETE FROM open_interest WHERE id NOT IN (
                SELECT id FROM open_interest ORDER BY recorded_at DESC LIMIT 50000)"""
