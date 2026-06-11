@@ -26,15 +26,14 @@ from utils import setup_logging, get_logger
 logger = get_logger(__name__)
 
 _BANNER = r"""
- _  __    ___  _   _   ___  _  _       ___   ____
-| |/ /   / _ \| | | | / _ \| || |     / _ \ |___  |
-| ' /   | |_| | | | || |_| | || |_   | | | |   / /
-| . \   |  _  | |_| ||  _  |__   _|  | |_| |  / /
-|_|\_\  |_| |_|\___/ |_| |_|  |_|     \___/  /_/
+ _  __ ___ _  _ ___ _ _ _ ___ ___
+| |/ / / _ \| \| | / _ \| || | / _ \|___|
+| ' < | |_| | \| || |_| || || |_ | | | | / /
+| . \ |  _ \| |_| ||  _ |__  _| | |_| | / /
+|_|\_\|_| |_|\___/ |_| |_| |_|  \___/ /_/
 
 KAVACH-07 | Futures Signal Bot | SIGNALS ONLY — NO AUTO-TRADE
 """
-
 
 class KAVACH07:
     """
@@ -49,7 +48,7 @@ class KAVACH07:
       7. Execution Engine (paper)
       8. Monitoring Engine
       9. Telegram Bot
-     10. Main scan loop
+      10. Main scan loop
     """
 
     def __init__(self):
@@ -285,8 +284,8 @@ class KAVACH07:
                 upnl_icon = "✅" if upnl >= 0 else "🔴"
                 lines.append(
                     f"{upnl_icon} {pos.symbol} {pos.direction}\n"
-                    f"  Entry: `{pos.entry_price:.6g}` | Now: `{current:.6g}`\n"
-                    f"  PnL: `{upnl:+.4f}` | {pos.strategy}"
+                    f" Entry: `{pos.entry_price:.6g}` | Now: `{current:.6g}`\n"
+                    f" PnL: `{upnl:+.4f}` | {pos.strategy}"
                 )
             return "\n".join(lines)
 
@@ -311,11 +310,11 @@ class KAVACH07:
 
         # Stop components in reverse order
         components = [
-            ("TelegramBot",       self._tg),
-            ("MonitoringEngine",  self._mon),
-            ("ExecutionEngine",   self._ee),
-            ("DataEngine",        self._de),
-            ("RiskManager",       self._rm),
+            ("TelegramBot", self._tg),
+            ("MonitoringEngine", self._mon),
+            ("ExecutionEngine", self._ee),
+            ("DataEngine", self._de),
+            ("RiskManager", self._rm),
         ]
         for name, comp in components:
             if comp:
@@ -330,7 +329,6 @@ class KAVACH07:
             logger.info("Database closed")
 
         logger.info("KAVACH-07 shutdown complete")
-
 
 # ─────────────────────────────────────────────────────────────
 # Entry point
@@ -372,7 +370,6 @@ def main() -> None:
         finally:
             loop.close()
             logger.info("Event loop closed")
-
 
 if __name__ == "__main__":
     main()
