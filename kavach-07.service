@@ -1,6 +1,6 @@
 [Unit]
 Description=KAVACH-07 Futures Signal Bot
-Documentation=https://github.com/your-repo/kavach-07
+Documentation=https://github.com/arunabhamaity148-cell/KAVACH-07
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600
@@ -8,8 +8,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=kavach
-Group=kavach
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/kavach-07
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/kavach-07/.env
@@ -29,7 +29,7 @@ LimitNPROC=4096
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/kavach-07 /var/log/kavach-07.log
+ReadWritePaths=/opt/kavach-07 /var/log
 
 # Logging
 StandardOutput=journal
