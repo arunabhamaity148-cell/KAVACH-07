@@ -216,16 +216,18 @@ class TelegramBot:
         if not self._auth(update):
             return
         text = (
-            "🤖 <b>KAVACH COMMANDS</b>\n"
+            "🤖 <b>KAVACH-07 COMMANDS</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "/status — Bot health\n"
-            "/pnl — Daily P&amp;L\n"
+            "/status — Bot health &amp; circuit state\n"
+            "/balance — P&amp;L &amp; balance\n"
             "/positions — Open trades\n"
-            "/history — Trade history\n"
-            "/stop — Emergency stop\n"
-            "/resume — Resume trading\n"
-            "/config — View settings\n"
-            "/help — This message"
+            "/signals — Last 5 signals\n"
+            "/trades — Last 5 closed trades\n"
+            "/report — Hourly performance report\n"
+            "/pause — Pause signal generation\n"
+            "/resume — Resume (clears halt too)\n"
+            "/halt — Emergency stop all\n"
+            "/config — View settings"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
