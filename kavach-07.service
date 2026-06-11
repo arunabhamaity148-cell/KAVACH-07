@@ -1,0 +1,40 @@
+[Unit]
+Description=KAVACH-07 Futures Signal Bot
+Documentation=https://github.com/your-repo/kavach-07
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=kavach
+Group=kavach
+WorkingDirectory=/opt/kavach-07
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/kavach-07/.env
+
+ExecStartPre=/opt/kavach-07/venv/bin/python -c "from config import get_config; get_config().validate(); print('Config OK')"
+ExecStart=/opt/kavach-07/venv/bin/python main.py
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=30s
+
+# Limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/kavach-07 /var/log/kavach-07.log
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kavach-07
+
+[Install]
+WantedBy=multi-user.target
