@@ -24,9 +24,15 @@ logger = get_logger(__name__)
 
 _WS_STALE_SECONDS   = 120   # No WS msg for 2 min → unhealthy
 _DATA_STALE_SECONDS = 60    # Data not updated for 60s → unhealthy
-_SIGNAL_STALE_HOURS = 2     # No signal for 2h → warning
+_SIGNAL_STALE_HOURS = 4     # FIX: 2h → 4h  (বাজার quiet থাকলে 2h signal না আসতেই পারে)
 _HEALTH_INTERVAL    = 30    # Health check every 30 seconds
 _REPORT_INTERVAL    = 3600  # Hourly report
+
+# FIX: debounce constant গুলো class-level এ তুলে আনা হয়েছে
+# আগে __init__ এর ভেতরে local variable ছিল — ফলে _run_health_check() এ দেখাই যেত না!
+# সেজন্যই debounce কাজ করছিল না এবং প্রতি ৩০ সেকেন্ডে alert যাচ্ছিল।
+_WS_ALERT_DEBOUNCE     = 300   # min 5 min between WS stale alerts
+_SIGNAL_ALERT_DEBOUNCE = 3600  # FIX: 30min → 60min between no-signal alerts
 
 
 class MonitoringEngine:
@@ -48,11 +54,10 @@ class MonitoringEngine:
         # Signal tracking
         self._last_signal_time: float = time.time()
 
-        # Alert debounce — prevent spam every 30s
+        # FIX: debounce tracker গুলো instance variable হিসেবে রাখা হয়েছে
+        # (আগে __init__-এ local variable ছিল, তাই _run_health_check-এ access হতো না)
         self._last_ws_alert_time: float = 0.0
         self._last_signal_alert_time: float = 0.0
-        _WS_ALERT_DEBOUNCE    = 300   # min 5 min between WS stale alerts
-        _SIGNAL_ALERT_DEBOUNCE = 1800  # min 30 min between no-signal alerts
 
         # Circuit breaker change detection
         self._last_circuit_state: str = "OK"
@@ -107,13 +112,13 @@ class MonitoringEngine:
         h = self._health
         now = time.time()
 
-        h.ws_alive      = (now - self._de.last_ws_msg) < _WS_STALE_SECONDS
-        h.data_fresh    = h.ws_alive   # Data freshness tied to WS liveness
+        h.ws_alive        = (now - self._de.last_ws_msg) < _WS_STALE_SECONDS
+        h.data_fresh      = h.ws_alive   # Data freshness tied to WS liveness
         h.signals_flowing = (now - self._last_signal_time) < _SIGNAL_STALE_HOURS * 3600
-        h.no_errors     = self._error_count < 20
-        h.uptime_seconds = now - self._start_time
-        h.ws_reconnects = self._de.ws_reconnects
-        h.error_count   = self._error_count
+        h.no_errors       = self._error_count < 20
+        h.uptime_seconds  = now - self._start_time
+        h.ws_reconnects   = self._de.ws_reconnects
+        h.error_count     = self._error_count
 
         # Memory tracking
         try:
@@ -126,12 +131,14 @@ class MonitoringEngine:
             pass
 
         # Alert on problems — debounced to prevent Telegram spam
+        # FIX: এখন module-level constant ব্যবহার করা হচ্ছে (_WS_ALERT_DEBOUNCE, _SIGNAL_ALERT_DEBOUNCE)
+        # এবং self._last_*_alert_time সঠিকভাবে update হচ্ছে
         if not h.ws_alive:
-            if (now - self._last_ws_alert_time) > 300:   # max 1 alert per 5 min
+            if (now - self._last_ws_alert_time) > _WS_ALERT_DEBOUNCE:
                 self._last_ws_alert_time = now
                 await self._send_alert("⚠️ WebSocket connection stale — data may be delayed")
         elif not h.signals_flowing:
-            if (now - self._last_signal_alert_time) > 1800:   # max 1 alert per 30 min
+            if (now - self._last_signal_alert_time) > _SIGNAL_ALERT_DEBOUNCE:
                 self._last_signal_alert_time = now
                 elapsed_h = (now - self._last_signal_time) / 3600
                 await self._send_alert(
