@@ -48,6 +48,15 @@ class MonitoringEngine:
         # Signal tracking
         self._last_signal_time: float = time.time()
 
+        # Alert debounce — prevent spam every 30s
+        self._last_ws_alert_time: float = 0.0
+        self._last_signal_alert_time: float = 0.0
+        _WS_ALERT_DEBOUNCE    = 300   # min 5 min between WS stale alerts
+        _SIGNAL_ALERT_DEBOUNCE = 1800  # min 30 min between no-signal alerts
+
+        # Circuit breaker change detection
+        self._last_circuit_state: str = "OK"
+
         # Callbacks
         self._on_alert_cbs: list = []
 
@@ -116,14 +125,28 @@ class MonitoringEngine:
         except Exception:
             pass
 
-        # Alert on problems
+        # Alert on problems — debounced to prevent Telegram spam
         if not h.ws_alive:
-            await self._send_alert("⚠️ WebSocket connection stale — data may be delayed")
+            if (now - self._last_ws_alert_time) > 300:   # max 1 alert per 5 min
+                self._last_ws_alert_time = now
+                await self._send_alert("⚠️ WebSocket connection stale — data may be delayed")
         elif not h.signals_flowing:
-            elapsed_h = (now - self._last_signal_time) / 3600
-            await self._send_alert(
-                f"⚠️ No signals in {elapsed_h:.1f}h — check strategy conditions"
-            )
+            if (now - self._last_signal_alert_time) > 1800:   # max 1 alert per 30 min
+                self._last_signal_alert_time = now
+                elapsed_h = (now - self._last_signal_time) / 3600
+                await self._send_alert(
+                    f"⚠️ No signals in {elapsed_h:.1f}h — check strategy conditions"
+                )
+
+        # Circuit breaker state change → immediate Telegram alert
+        current_circuit = self._rm.metrics.circuit_state
+        if current_circuit != self._last_circuit_state:
+            self._last_circuit_state = current_circuit
+            if current_circuit != "OK":
+                reason = self._rm.metrics.circuit_reason
+                await self._send_alert(
+                    f"🚨 <b>CIRCUIT BREAKER: {current_circuit}</b>\n{reason}"
+                )
 
         logger.debug(
             f"Health: WS={'✅' if h.ws_alive else '❌'} "
