@@ -22,10 +22,10 @@ from utils import get_logger
 
 logger = get_logger(__name__)
 
-_MAX_MSG_LEN  = 4096
-_RETRY_DELAY  = 3      # seconds before retrying failed send
-_MAX_RETRIES  = 5
-_RATE_DELAY   = 0.5    # min seconds between messages
+_MAX_MSG_LEN = 4096
+_RETRY_DELAY = 3  # seconds before retrying failed send
+_MAX_RETRIES = 5
+_RATE_DELAY = 0.5  # min seconds between messages
 
 
 class TelegramBot:
@@ -67,17 +67,17 @@ class TelegramBot:
         self._bot = self._app.bot
 
         handlers = [
-            ("start",     self._cmd_start),
-            ("status",    self._cmd_status),
-            ("balance",   self._cmd_balance),
-            ("signals",   self._cmd_signals),
-            ("trades",    self._cmd_trades),
+            ("start", self._cmd_start),
+            ("status", self._cmd_status),
+            ("balance", self._cmd_balance),
+            ("signals", self._cmd_signals),
+            ("trades", self._cmd_trades),
             ("positions", self._cmd_positions),
-            ("pause",     self._cmd_pause),
-            ("resume",    self._cmd_resume),
-            ("halt",      self._cmd_halt),
-            ("report",    self._cmd_report),
-            ("config",    self._cmd_config),
+            ("pause", self._cmd_pause),
+            ("resume", self._cmd_resume),
+            ("halt", self._cmd_halt),
+            ("report", self._cmd_report),
+            ("config", self._cmd_config),
         ]
         for name, handler in handlers:
             self._app.add_handler(CommandHandler(name, handler))
@@ -86,7 +86,7 @@ class TelegramBot:
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
 
-        await self.send("🚀 <b>KAVACH-07 ONLINE</b>\nSignal bot started successfully.", parse_md=True)
+        await self.send("🚀 **KAVACH-07 ONLINE**\nSignal bot started successfully.", parse_md=True)
         logger.info("Telegram bot started")
 
     async def stop(self) -> None:
@@ -144,68 +144,68 @@ class TelegramBot:
             icon = "🚀"
 
         dir_icon = "🟢" if sig.direction == "LONG" else "🔴"
-        tp2_line = f"\nTP2: <code>{sig.tp2_price:.6g}</code>" if sig.tp2_price else ""
+        tp2_line = f"\nTP2: `{sig.tp2_price:.6g}`" if sig.tp2_price else ""
 
         text = (
-            f"{icon} <b>KAVACH-07 SIGNAL</b>\n"
+            f"{icon} **KAVACH-07 SIGNAL**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Pair:</b> <code>{sig.symbol}</code>\n"
-            f"<b>Strategy:</b> <code>{sig.strategy}</code>\n"
-            f"<b>Direction:</b> {dir_icon} <code>{sig.direction}</code>\n"
-            f"<b>Confidence:</b> <code>{sig.confidence*100:.0f}%</code>\n"
+            f" **Pair:** `{sig.symbol}`\n"
+            f" **Strategy:** `{sig.strategy}`\n"
+            f" **Direction:** {dir_icon} `{sig.direction}`\n"
+            f" **Confidence:** `{sig.confidence*100:.0f}%`\n"
             f"\n"
-            f"<b>Entry:</b> <code>{sig.entry_price:.6g}</code> ({sig.entry_type})\n"
-            f"<b>SL:</b> <code>{sig.sl_price:.6g}</code>\n"
-            f"<b>TP1:</b> <code>{sig.tp1_price:.6g}</code> ({sig.r_ratio:.1f}R){tp2_line}\n"
+            f" **Entry:** `{sig.entry_price:.6g}` ({sig.entry_type})\n"
+            f" **SL:** `{sig.sl_price:.6g}`\n"
+            f" **TP1:** `{sig.tp1_price:.6g}` ({sig.r_ratio:.1f}R){tp2_line}\n"
             f"\n"
-            f"<b>Rationale:</b>\n{sig.rationale}\n"
+            f" **Rationale:**\n{sig.rationale}\n"
             f"\n"
-            f"<b>Risk:</b> <code>{sig.risk_pct*100:.2f}%</code> | <b>ML:</b> <code>{sig.ml_score*100:.0f}%</code>\n"
-            f"<b>Time:</b> <code>{sig.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC</code>"
+            f" **Risk:** `{sig.risk_pct*100:.2f}%` | **ML:** `{sig.ml_score*100:.0f}%`\n"
+            f" **Time:** `{sig.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC`"
         )
         await self.send(text, parse_md=True)
 
     async def alert_trade_opened(self, pos: Position) -> None:
         dir_icon = "🟢" if pos.direction == "LONG" else "🔴"
         text = (
-            f"📋 <b>Position Opened</b>\n"
+            f"📋 **Position Opened**\n"
             f"{dir_icon} {pos.symbol} | {pos.direction} | {pos.strategy}\n"
-            f"Entry: <code>{pos.entry_price:.6g}</code> | Size: <code>{pos.size:.4g}</code>\n"
-            f"SL: <code>{pos.sl_price:.6g}</code> | TP1: <code>{pos.tp1_price:.6g}</code>"
+            f"Entry: `{pos.entry_price:.6g}` | Size: `{pos.size:.4g}`\n"
+            f"SL: `{pos.sl_price:.6g}` | TP1: `{pos.tp1_price:.6g}`"
         )
         await self.send(text, parse_md=True)
 
     async def alert_trade_closed(self, result: TradeResult) -> None:
         pnl_icon = "✅" if result.pnl > 0 else "❌"
         text = (
-            f"{pnl_icon} <b>Trade Closed — {result.exit_reason}</b>\n"
+            f"{pnl_icon} **Trade Closed — {result.exit_reason}**\n"
             f"{result.symbol} | {result.direction} | {result.strategy}\n"
-            f"Entry: <code>{result.entry_price:.6g}</code> → Exit: <code>{result.exit_price:.6g}</code>\n"
-            f"PnL: <code>{result.pnl:+.4f}</code> | R: <code>{result.r_multiple:+.2f}R</code>\n"
-            f"Duration: <code>{result.duration_seconds/3600:.1f}h</code>"
+            f"Entry: `{result.entry_price:.6g}` → Exit: `{result.exit_price:.6g}`\n"
+            f"PnL: `{result.pnl:+.4f}` | R: `{result.r_multiple:+.2f}R`\n"
+            f"Duration: `{result.duration_seconds/3600:.1f}h`"
         )
         await self.send(text, parse_md=True)
 
     async def alert_regime(self, regime: RegimeSignal) -> None:
         icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(regime.bias, "⚪")
         text = (
-            f"📊 <b>KAVACH-07 REGIME</b>\n"
+            f"📊 **KAVACH-07 REGIME**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Global Filter: {icon} <code>{regime.bias}</code>\n"
-            f"Confidence: <code>{regime.confidence*100:.0f}%</code>\n"
+            f"Global Filter: {icon} `{regime.bias}`\n"
+            f"Confidence: `{regime.confidence*100:.0f}%`\n"
             f"\n"
-            f"<b>Rationale:</b>\n"
-            f"• Avg Funding: <code>{regime.avg_funding*100:.4f}%</code>\n"
-            f"• OI Trend: <code>{regime.oi_trend*100:+.1f}%</code>\n"
+            f" **Rationale:**\n"
+            f"• Avg Funding: `{regime.avg_funding*100:.4f}%`\n"
+            f"• OI Trend: `{regime.oi_trend*100:+.1f}%`\n"
             f"\n"
-            f"Impact: Size multiplier <code>{regime.position_multiplier:.1f}x</code>\n"
-            f"Time: <code>{regime.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC</code>"
+            f"Impact: Size multiplier `{regime.position_multiplier:.1f}x`\n"
+            f"Time: `{regime.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC`"
         )
         await self.send(text, parse_md=True)
 
     async def alert_circuit_breaker(self, state: str, reason: str) -> None:
         icon = "🚨" if state == "HALT" else "⚠️"
-        await self.send(f"{icon} <b>CIRCUIT BREAKER: {state}</b>\n{reason}", parse_md=True)
+        await self.send(f"{icon} **CIRCUIT BREAKER: {state}**\n{reason}", parse_md=True)
 
     # ─── Command handlers ─────────────────────────────────────
 
@@ -216,10 +216,10 @@ class TelegramBot:
         if not self._auth(update):
             return
         text = (
-            "🤖 <b>KAVACH-07 COMMANDS</b>\n"
+            "🤖 **KAVACH-07 COMMANDS**\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "/status — Bot health &amp; circuit state\n"
-            "/balance — P&amp;L &amp; balance\n"
+            "/status — Bot health & circuit state\n"
+            "/balance — P&L & balance\n"
             "/positions — Open trades\n"
             "/signals — Last 5 signals\n"
             "/trades — Last 5 closed trades\n"
@@ -256,7 +256,7 @@ class TelegramBot:
         if not sigs:
             await update.message.reply_text("No signals yet.")
             return
-        lines = ["📡 <b>Last 5 Signals</b>\n"]
+        lines = ["📡 **Last 5 Signals**\n"]
         for s in sigs:
             ts = datetime.fromtimestamp(s["timestamp"] / 1000, tz=timezone.utc)
             lines.append(
@@ -273,7 +273,7 @@ class TelegramBot:
         if not trades:
             await update.message.reply_text("No trades yet.")
             return
-        lines = ["📊 <b>Last 5 Trades</b>\n"]
+        lines = ["📊 **Last 5 Trades**\n"]
         for t in trades:
             pnl_icon = "✅" if t["pnl"] > 0 else "❌"
             lines.append(
@@ -286,33 +286,39 @@ class TelegramBot:
         if not self._auth(update):
             return
         if self._positions_provider:
-            text = await self._positions_provider()
+            try:
+                text = await self._positions_provider()
+                # Escape any HTML special chars that might break parsing
+                text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"Positions command error: {e}")
+                await update.message.reply_text(f"Error fetching positions: {str(e)}")
         else:
-            text = "Positions provider not registered"
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            await update.message.reply_text("Positions provider not registered")
 
     async def _cmd_pause(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
         if self._on_pause:
             await self._on_pause()
-        await update.message.reply_text("⏸️ Signal generation paused.")
+            await update.message.reply_text("⏸️ Signal generation paused.")
 
     async def _cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
         if self._on_resume:
             await self._on_resume()
-        await update.message.reply_text("▶️ Signal generation resumed.")
+            await update.message.reply_text("▶️ Signal generation resumed.")
 
     async def _cmd_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
             return
         if self._on_halt:
             await self._on_halt()
-        await update.message.reply_text(
-            "🚨 Emergency halt activated. Use /resume to re-enable."
-        )
+            await update.message.reply_text(
+                "🚨 Emergency halt activated. Use /resume to re-enable."
+            )
 
     async def _cmd_report(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update):
@@ -328,14 +334,14 @@ class TelegramBot:
             return
         cfg = self._cfg
         text = (
-            f"⚙️ <b>KAVACH-07 Config</b>\n"
-            f"Mode: <code>{'TESTNET' if cfg.USE_TESTNET else 'LIVE'}</code>\n"
-            f"Pairs: <code>{len(cfg.BASE_PAIRS)}</code>\n"
-            f"Strategies: <code>{len(cfg.STRATEGIES)}</code>\n"
-            f"Risk/trade: <code>{cfg.MAX_RISK_PER_TRADE*100:.2f}%</code>\n"
-            f"Max exposure: <code>{cfg.MAX_TOTAL_EXPOSURE*100:.1f}%</code>\n"
-            f"ML threshold: <code>{cfg.ML_CONFIDENCE_THRESHOLD}</code>\n"
-            f"Scan interval: <code>{cfg.SCAN_INTERVAL}s</code>"
+            f"⚙️ **KAVACH-07 Config**\n"
+            f"Mode: `{'TESTNET' if cfg.USE_TESTNET else 'LIVE'}`\n"
+            f"Pairs: `{len(cfg.BASE_PAIRS)}`\n"
+            f"Strategies: `{len(cfg.STRATEGIES)}`\n"
+            f"Risk/trade: `{cfg.MAX_RISK_PER_TRADE*100:.2f}%`\n"
+            f"Max exposure: `{cfg.MAX_TOTAL_EXPOSURE*100:.1f}%`\n"
+            f"ML threshold: `{cfg.ML_CONFIDENCE_THRESHOLD}`\n"
+            f"Scan interval: `{cfg.SCAN_INTERVAL}s`"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
