@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from config import Config
@@ -43,6 +43,7 @@ class RiskManager:
         self._open_exposure: float = 0.0   # Sum of (risk_pct × balance) for open positions
         self._lock = asyncio.Lock()
         self._save_task: Optional[asyncio.Task] = None
+        self._on_halt_cb = None  # Callable for circuit breaker Telegram alerts
 
     # ─── Lifecycle ───────────────────────────────────────────
 
@@ -67,6 +68,7 @@ class RiskManager:
             m.circuit_state        = row.get("circuit_state", _CB_OK)
             m.circuit_reason       = row.get("circuit_reason", "")
             m.halt_until           = row.get("halt_until")
+            m.paused               = bool(row.get("paused", 0))
 
             # Recalculate drawdown
             if m.peak_balance > 0:
@@ -278,15 +280,21 @@ class RiskManager:
         m.halt_until = until
         hours = (until - time.time()) / 3600
         logger.critical(f"CIRCUIT BREAKER HALT: {reason} | Duration: {hours:.1f}h")
+        # Fire Telegram alert if wired
+        if self._on_halt_cb:
+            asyncio.create_task(self._on_halt_cb(_CB_HALT, reason))
+
+    def register_halt_callback(self, cb) -> None:
+        """Register a coroutine callback (state, reason) for circuit breaker events."""
+        self._on_halt_cb = cb
 
     @staticmethod
     def _next_midnight() -> float:
-        """UTC timestamp of next midnight."""
+        """UTC timestamp of next midnight. Uses timedelta — safe on any month-end day."""
         now = datetime.now(timezone.utc)
-        tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if tomorrow <= now:
-            tomorrow = tomorrow.replace(day=tomorrow.day + 1)
-        return tomorrow.timestamp()
+        # Truncate to today midnight, then add 1 day — never fails (no day+1 arithmetic)
+        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return (today_midnight + timedelta(days=1)).timestamp()
 
     # ─── Daily reset ─────────────────────────────────────────
 
