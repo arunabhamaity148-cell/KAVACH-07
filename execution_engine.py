@@ -188,7 +188,8 @@ class ExecutionEngine:
             return
 
         for pos_id, pos in list(self._positions.items()):
-            if pos.status != "OPEN":
+            # Check OPEN and TP1_HIT — TP1_HIT still needs TP2/SL-at-breakeven monitoring
+            if pos.status not in ("OPEN", "TP1_HIT"):
                 continue
 
             try:
