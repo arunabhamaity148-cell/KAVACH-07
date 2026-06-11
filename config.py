@@ -12,7 +12,6 @@ from typing import List
 
 from dotenv import load_dotenv
 
-
 def _load_env() -> None:
     """Load .env from cwd or parent directories."""
     for p in [Path.cwd(), Path.cwd().parent]:
@@ -23,13 +22,10 @@ def _load_env() -> None:
     # Fallback: load from environment variables already set
     load_dotenv()
 
-
 _load_env()
-
 
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
-
 
 def _env_float(key: str, default: float) -> float:
     v = _env(key)
@@ -38,14 +34,12 @@ def _env_float(key: str, default: float) -> float:
     except ValueError:
         return default
 
-
 def _env_int(key: str, default: int) -> int:
     v = _env(key)
     try:
         return int(v) if v else default
     except ValueError:
         return default
-
 
 def _env_bool(key: str, default: bool) -> bool:
     v = _env(key).lower()
@@ -54,7 +48,6 @@ def _env_bool(key: str, default: bool) -> bool:
     if v in ("0", "false", "no"):
         return False
     return default
-
 
 @dataclass
 class Config:
@@ -124,6 +117,9 @@ class Config:
     WS_RECONNECT_DELAY: int = field(default_factory=lambda: _env_int("WS_RECONNECT_DELAY", 5))
     MAX_WS_RECONNECT_DELAY: int = field(default_factory=lambda: _env_int("MAX_WS_RECONNECT_DELAY", 300))
 
+    # ─── Risk State File ─────────────────────────────────────
+    RISK_STATE_FILE: str = field(default_factory=lambda: _env("RISK_STATE_FILE", "/opt/kavach-07/data/risk_state.json"))
+
     # ─── External ────────────────────────────────────────────
     BYBIT_API_URL: str = field(default_factory=lambda: _env("BYBIT_API_URL", "https://api.bybit.com"))
 
@@ -152,7 +148,7 @@ class Config:
         if errors:
             print("CONFIG ERRORS — KAVACH-07 cannot start:")
             for e in errors:
-                print(f"  ✗ {e}")
+                print(f" ✗ {e}")
             sys.exit(1)
 
         # Derived URLs
@@ -173,10 +169,8 @@ class Config:
             f"Risk={self.MAX_RISK_PER_TRADE*100:.1f}%/trade"
         )
 
-
 # Singleton
 _config: Config | None = None
-
 
 def get_config() -> Config:
     global _config
