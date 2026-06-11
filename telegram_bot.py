@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from telegram import Bot, Update
@@ -26,6 +26,20 @@ _MAX_MSG_LEN = 4096
 _RETRY_DELAY = 3  # seconds before retrying failed send
 _MAX_RETRIES = 5
 _RATE_DELAY = 0.5  # min seconds between messages
+
+# Strategy hold times
+STRATEGY_HOLD_TIMES = {
+    "LIQUIDATION_FADE": "20-60 min",
+    "FUNDING_SQUEEZE": "1-3 hours",
+    "OB_IMBALANCE": "3-12 min",
+    "LIQUIDITY_SWEEP": "30 min - 2 hours",
+    "VP_NODE": "30 min - 4 hours",
+    "OI_BREAKOUT": "1-4 hours",
+    "BASIS_REVERSION": "4-12 hours",
+    "SOCIAL_FADE": "30 min - 2 hours",
+    "EXCHANGE_ARB": "5-30 min",
+    "REGIME_FILTER": "N/A",
+}
 
 
 class TelegramBot:
@@ -137,9 +151,21 @@ class TelegramBot:
                     logger.error(f"Telegram unexpected error: {e}")
                     return
 
+    def _get_ist_time(self, utc_dt: datetime) -> str:
+        """Convert UTC to IST (UTC+5:30)"""
+        ist_offset = timedelta(hours=5, minutes=30)
+        ist_dt = utc_dt + ist_offset
+        return ist_dt.strftime("%Y-%m-%d %H:%M")
+
+    def _get_hold_time(self, strategy: str) -> str:
+        """Get expected hold time for strategy"""
+        return STRATEGY_HOLD_TIMES.get(strategy, "Varies")
+
     async def alert_signal(self, sig: Signal) -> None:
         """Premium signal alert — easy copy-paste for CoinDCX"""
         dir_icon = "🟢" if sig.direction == "LONG" else "🔴"
+        ist_time = self._get_ist_time(sig.timestamp)
+        hold_time = self._get_hold_time(sig.strategy)
 
         text = (
             f"🚨 KAVACH-07 SIGNAL\n"
@@ -163,33 +189,39 @@ class TelegramBot:
             f"📋 R/R: {sig.r_ratio:.1f}R\n"
             f"⚡ Risk: {sig.risk_pct*100:.2f}%\n"
             f"🤖 ML: {sig.ml_score*100:.0f}%\n"
-            f"⏰ {sig.timestamp.strftime('%Y-%m-%d %H:%M')} IST"
+            f"⏱️ Hold Time: {hold_time}\n"
+            f"🕐 IST: {ist_time}"
         )
         await self.send(text)
 
     async def alert_trade_opened(self, pos: Position) -> None:
         dir_icon = "🟢" if pos.direction == "LONG" else "🔴"
+        ist_time = self._get_ist_time(pos.open_time)
         text = (
             f"📋 Position Opened\n"
             f"{dir_icon} {pos.symbol} | {pos.direction} | {pos.strategy}\n"
             f"Entry: {pos.entry_price:.6g} | Size: {pos.size:.4g}\n"
-            f"SL: {pos.sl_price:.6g} | TP1: {pos.tp1_price:.6g}"
+            f"SL: {pos.sl_price:.6g} | TP1: {pos.tp1_price:.6g}\n"
+            f"🕐 IST: {ist_time}"
         )
         await self.send(text)
 
     async def alert_trade_closed(self, result: TradeResult) -> None:
         pnl_icon = "✅" if result.pnl > 0 else "❌"
+        ist_time = self._get_ist_time(result.close_time or datetime.now(timezone.utc))
         text = (
             f"{pnl_icon} Trade Closed — {result.exit_reason}\n"
             f"{result.symbol} | {result.direction} | {result.strategy}\n"
             f"Entry: {result.entry_price:.6g} → Exit: {result.exit_price:.6g}\n"
             f"PnL: {result.pnl:+.4f} | R: {result.r_multiple:+.2f}R\n"
-            f"Duration: {result.duration_seconds/3600:.1f}h"
+            f"Duration: {result.duration_seconds/3600:.1f}h\n"
+            f"🕐 IST: {ist_time}"
         )
         await self.send(text)
 
     async def alert_regime(self, regime: RegimeSignal) -> None:
         icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(regime.bias, "⚪")
+        ist_time = self._get_ist_time(regime.timestamp)
         text = (
             f"📊 KAVACH-07 REGIME\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -201,13 +233,14 @@ class TelegramBot:
             f"• OI Trend: {regime.oi_trend*100:+.1f}%\n"
             f"\n"
             f"Impact: Size multiplier {regime.position_multiplier:.1f}x\n"
-            f"Time: {regime.timestamp.strftime('%Y-%m-%d %H:%M')} IST"
+            f"🕐 IST: {ist_time}"
         )
         await self.send(text)
 
     async def alert_circuit_breaker(self, state: str, reason: str) -> None:
         icon = "🚨" if state == "HALT" else "⚠️"
-        await self.send(f"{icon} CIRCUIT BREAKER: {state}\n{reason}")
+        ist_time = self._get_ist_time(datetime.now(timezone.utc))
+        await self.send(f"{icon} CIRCUIT BREAKER: {state}\n{reason}\n🕐 IST: {ist_time}")
 
     # ─── Command handlers ─────────────────────────────────────
 
@@ -261,10 +294,11 @@ class TelegramBot:
         lines = ["📡 Last 5 Signals\n"]
         for s in sigs:
             ts = datetime.fromtimestamp(s["timestamp"] / 1000, tz=timezone.utc)
+            ist_time = self._get_ist_time(ts)
             lines.append(
                 f"• {s['symbol']} {s['direction']} | {s['strategy']}\n"
                 f"  Conf: {s['confidence']*100:.0f}% | "
-                f"{ts.strftime('%m-%d %H:%M')} UTC\n"
+                f"IST: {ist_time}\n"
             )
         await update.message.reply_text("\n".join(lines))
 
