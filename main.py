@@ -115,6 +115,9 @@ class KAVACH07:
         # 9. Wire callbacks
         self._wire_callbacks()
 
+        # Wire circuit breaker → Telegram
+        self._rm.register_halt_callback(self._tg.alert_circuit_breaker)
+
         logger.info("All components started — entering main scan loop")
         await self._scan_loop()
 
