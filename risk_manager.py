@@ -18,17 +18,16 @@ from utils import get_logger
 logger = get_logger(__name__)
 
 # Circuit breaker states
-_CB_OK     = "OK"
+_CB_OK = "OK"
 _CB_REDUCE = "REDUCE"
-_CB_HALT   = "HALT"
+_CB_HALT = "HALT"
 
 # Drawdown adjustments
 _DD_LEVELS = [
-    (0.05, 0.75),   # 5% DD → 75% size
-    (0.10, 0.50),   # 10% DD → 50% size
-    (0.15, 0.00),   # 15% DD → HALT
+    (0.05, 0.75),  # 5% DD → 75% size
+    (0.10, 0.50),  # 10% DD → 50% size
+    (0.15, 0.00),  # 15% DD → HALT
 ]
-
 
 class RiskManager:
 
@@ -40,7 +39,7 @@ class RiskManager:
             peak_balance=config.INITIAL_BALANCE,
             daily_start_balance=config.INITIAL_BALANCE,
         )
-        self._open_exposure: float = 0.0   # Sum of (risk_pct × balance) for open positions
+        self._open_exposure: float = 0.0  # Sum of (risk_pct × balance) for open positions
         self._lock = asyncio.Lock()
         self._save_task: Optional[asyncio.Task] = None
         self._on_halt_cb = None  # Callable for circuit breaker Telegram alerts
@@ -52,23 +51,23 @@ class RiskManager:
         row = await self._db.load_risk_metrics()
         if row:
             m = self._metrics
-            m.balance              = float(row.get("balance", m.balance))
-            m.peak_balance         = float(row.get("peak_balance", m.peak_balance))
-            m.total_pnl            = float(row.get("total_pnl", 0))
-            m.gross_profit         = float(row.get("gross_profit", 0))
-            m.gross_loss           = float(row.get("gross_loss", 0))
-            m.total_trades         = int(row.get("total_trades", 0))
-            m.winning_trades       = int(row.get("winning_trades", 0))
-            m.losing_trades        = int(row.get("losing_trades", 0))
-            m.consecutive_losses   = int(row.get("consecutive_losses", 0))
-            m.consecutive_wins     = int(row.get("consecutive_wins", 0))
-            m.total_signals        = int(row.get("total_signals", 0))
-            m.daily_pnl            = float(row.get("daily_pnl", 0))
-            m.daily_start_balance  = float(row.get("daily_start_balance", m.balance))
-            m.circuit_state        = row.get("circuit_state", _CB_OK)
-            m.circuit_reason       = row.get("circuit_reason", "")
-            m.halt_until           = row.get("halt_until")
-            m.paused               = bool(row.get("paused", 0))
+            m.balance = float(row.get("balance", m.balance))
+            m.peak_balance = float(row.get("peak_balance", m.peak_balance))
+            m.total_pnl = float(row.get("total_pnl", 0))
+            m.gross_profit = float(row.get("gross_profit", 0))
+            m.gross_loss = float(row.get("gross_loss", 0))
+            m.total_trades = int(row.get("total_trades", 0))
+            m.winning_trades = int(row.get("winning_trades", 0))
+            m.losing_trades = int(row.get("losing_trades", 0))
+            m.consecutive_losses = int(row.get("consecutive_losses", 0))
+            m.consecutive_wins = int(row.get("consecutive_wins", 0))
+            m.total_signals = int(row.get("total_signals", 0))
+            m.daily_pnl = float(row.get("daily_pnl", 0))
+            m.daily_start_balance = float(row.get("daily_start_balance", m.balance))
+            m.circuit_state = row.get("circuit_state", _CB_OK)
+            m.circuit_reason = row.get("circuit_reason", "")
+            m.halt_until = row.get("halt_until")
+            m.paused = bool(row.get("paused", 0))
 
             # Recalculate drawdown
             if m.peak_balance > 0:
@@ -208,12 +207,12 @@ class RiskManager:
             # Save to DB immediately on trade close
             await self._db.save_risk_metrics(m)
 
-        logger.info(
-            f"Balance: ${m.balance:.2f} | "
-            f"PnL: {result.pnl:+.2f} | "
-            f"Drawdown: {m.drawdown*100:.1f}% | "
-            f"WR: {m.win_rate*100:.0f}% ({m.total_trades} trades)"
-        )
+            logger.info(
+                f"Balance: ${m.balance:.2f} | "
+                f"PnL: {result.pnl:+.2f} | "
+                f"Drawdown: {m.drawdown*100:.1f}% | "
+                f"WR: {m.win_rate*100:.0f}% ({m.total_trades} trades)"
+            )
 
     def increment_signals(self) -> None:
         self._metrics.total_signals += 1
@@ -271,7 +270,7 @@ class RiskManager:
                 logger.info("Circuit breaker REDUCE cleared")
 
     def _trigger_halt(self, reason: str, duration_s: float = 0,
-                       until: Optional[float] = None) -> None:
+                      until: Optional[float] = None) -> None:
         m = self._metrics
         if until is None:
             until = time.time() + duration_s
@@ -303,7 +302,7 @@ class RiskManager:
         async with self._lock:
             self._metrics.daily_start_balance = self._metrics.balance
             self._metrics.daily_pnl = 0.0
-        logger.info(f"Daily reset — new start balance: ${self._metrics.balance:.2f}")
+            logger.info(f"Daily reset — new start balance: ${self._metrics.balance:.2f}")
 
     # ─── Persistence ─────────────────────────────────────────
 
