@@ -23,11 +23,13 @@ from utils import get_logger
 logger = get_logger(__name__)
 
 # Paper trade simulation parameters
-_SLIPPAGE_BPS_BASE  = 2       # 2bps base slippage
-_SLIPPAGE_BPS_SPIKE = 8       # up to 8bps in volatile markets
-_MISSED_FILL_RATE   = 0.08    # 8% chance LIMIT order misses
-_POSITION_EXPIRY_HOURS = 24   # Auto-close after 24h
+_SLIPPAGE_BPS_BASE = 2  # 2bps base slippage
+_SLIPPAGE_BPS_SPIKE = 8  # up to 8bps in volatile markets
+_MISSED_FILL_RATE = 0.08  # 8% chance LIMIT order misses
+_POSITION_EXPIRY_HOURS = 24  # Auto-close after 24h
 
+# FIX: Seed random for reproducible testing
+random.seed(42)
 
 class ExecutionEngine:
     """
@@ -84,8 +86,8 @@ class ExecutionEngine:
         Attempt to paper-trade a signal.
         Returns Position if filled, None if rejected (risk/limit/miss).
         """
-        # Risk check
-        size, rejection_reason = self._rm.calculate_size(signal)
+        # Risk check — now async and reserves exposure synchronously
+        size, rejection_reason = await self._rm.calculate_size(signal)
         if size <= 0:
             logger.info(f"Signal rejected by risk manager: {rejection_reason} | {signal.symbol}")
             return None
@@ -93,6 +95,22 @@ class ExecutionEngine:
         # Simulate fill
         fill_price = self._simulate_fill(signal)
         if fill_price is None:
+            # FIX: Release reserved exposure if fill missed
+            await self._rm.on_trade_closed(TradeResult(
+                position_id="",
+                symbol=signal.symbol,
+                strategy=signal.strategy,
+                direction=signal.direction,
+                entry_price=signal.entry_price,
+                exit_price=signal.entry_price,
+                size=0,
+                pnl=0,
+                exit_reason="MISSED_FILL",
+                duration_seconds=0,
+                r_multiple=0,
+                confidence=signal.confidence,
+                reserved_risk=signal.risk_pct * self._rm.balance,
+            ))
             logger.info(f"LIMIT order missed: {signal.symbol} {signal.strategy}")
             return None
 
@@ -112,10 +130,8 @@ class ExecutionEngine:
             confidence=signal.confidence,
             status="OPEN",
             expiry=now + timedelta(hours=_POSITION_EXPIRY_HOURS),
+            reserved_risk=signal.risk_pct * self._rm.balance,
         )
-
-        # Register with risk manager (reserve exposure)
-        self._rm.on_position_opened(pos)
 
         # Persist
         self._positions[pos.id] = pos
@@ -157,9 +173,9 @@ class ExecutionEngine:
             # MARKET fill at current price + slippage
             fill_price = current
 
-        # Slippage
-        vol_ratio = 1.0  # Could adjust based on market conditions
-        slippage_bps = random.uniform(_SLIPPAGE_BPS_BASE, _SLIPPAGE_BPS_SPIKE * vol_ratio)
+        # FIX: Dynamic slippage based on volume ratio
+        vol_ratio = getattr(signal, 'volume_ratio', 1.0)
+        slippage_bps = random.uniform(_SLIPPAGE_BPS_BASE, _SLIPPAGE_BPS_SPIKE * max(1.0, vol_ratio))
         slippage_pct = slippage_bps / 10_000
 
         if signal.direction == "LONG":
@@ -180,7 +196,7 @@ class ExecutionEngine:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.error(f"Heartbeat error:\n{traceback.format_exc()}")
+                logger.error(f"Heartbeat error:\\n{traceback.format_exc()}")
             await asyncio.sleep(self._cfg.HEARTBEAT_INTERVAL)
 
     async def _check_all_positions(self) -> None:
@@ -188,7 +204,7 @@ class ExecutionEngine:
             return
 
         for pos_id, pos in list(self._positions.items()):
-            # Check OPEN and TP1_HIT — TP1_HIT still needs TP2/SL-at-breakeven monitoring
+            # FIX: Check both OPEN and TP1_HIT
             if pos.status not in ("OPEN", "TP1_HIT"):
                 continue
 
@@ -200,7 +216,7 @@ class ExecutionEngine:
                 await self._check_position(pos, current)
 
             except Exception:
-                logger.error(f"Position check error [{pos_id}]:\n{traceback.format_exc()}")
+                logger.error(f"Position check error [{pos_id}]:\\n{traceback.format_exc()}")
 
     async def _check_position(self, pos: Position, current: float) -> None:
         now = datetime.now(timezone.utc)
@@ -227,7 +243,7 @@ class ExecutionEngine:
         # ── Stop Loss ─────────────────────────────────────────
         elif pos.direction == "LONG" and current <= pos.sl_price:
             close_reason = "SL"
-            close_price = pos.sl_price  # Assume fills at SL (conservative)
+            close_price = pos.sl_price
 
         elif pos.direction == "SHORT" and current >= pos.sl_price:
             close_reason = "SL"
@@ -245,10 +261,12 @@ class ExecutionEngine:
                     f"SL moved to breakeven | TP2: {pos.tp2_price:.4f}"
                 )
                 pos.status = "TP1_HIT"
+                # FIX: Update size after partial close
+                pos.size *= 0.5
                 await self._db.update_position(pos)
-                # Record partial close (half size)
-                partial_pnl = (close_price - pos.entry_price) * (pos.size * 0.5)
-                await self._record_trade(pos, current, "TP1", partial_pnl, 0.5)
+                # FIX: Use tp1_price for partial close PnL
+                partial_pnl = (pos.tp1_price - pos.entry_price) * pos.size
+                await self._record_trade(pos, pos.tp1_price, "TP1", partial_pnl, 0.5)
                 return
             else:
                 close_reason = "TP1"
@@ -263,9 +281,12 @@ class ExecutionEngine:
                     f"SL moved to breakeven"
                 )
                 pos.status = "TP1_HIT"
+                # FIX: Update size after partial close
+                pos.size *= 0.5
                 await self._db.update_position(pos)
-                partial_pnl = (pos.entry_price - close_price) * (pos.size * 0.5)
-                await self._record_trade(pos, current, "TP1", partial_pnl, 0.5)
+                # FIX: Use tp1_price for partial close PnL
+                partial_pnl = (pos.entry_price - pos.tp1_price) * pos.size
+                await self._record_trade(pos, pos.tp1_price, "TP1", partial_pnl, 0.5)
                 return
             else:
                 close_reason = "TP1"
@@ -273,19 +294,19 @@ class ExecutionEngine:
 
         # ── Take Profit 2 (after TP1 hit) ────────────────────
         elif pos.tp2_price and pos.tp1_hit:
-            if pos.direction == "LONG" and current >= pos.tp2_price:
-                close_reason = "TP2"
-                close_price = pos.tp2_price
-            elif pos.direction == "SHORT" and current <= pos.tp2_price:
-                close_reason = "TP2"
-                close_price = pos.tp2_price
-            # Also check SL hit on TP1_HIT positions (now at breakeven)
-            elif pos.direction == "LONG" and current <= pos.sl_price:
+            # FIX: Check SL BEFORE TP2 (priority)
+            if pos.direction == "LONG" and current <= pos.sl_price:
                 close_reason = "SL"
                 close_price = pos.sl_price
             elif pos.direction == "SHORT" and current >= pos.sl_price:
                 close_reason = "SL"
                 close_price = pos.sl_price
+            elif pos.direction == "LONG" and current >= pos.tp2_price:
+                close_reason = "TP2"
+                close_price = pos.tp2_price
+            elif pos.direction == "SHORT" and current <= pos.tp2_price:
+                close_reason = "TP2"
+                close_price = pos.tp2_price
 
         if close_reason:
             await self._close_position(pos, close_price, close_reason)
@@ -299,19 +320,11 @@ class ExecutionEngine:
         else:
             pnl = (pos.entry_price - close_price) * pos.size
 
-        # If TP1 was already taken (half closed), remaining half:
-        if pos.tp1_hit and pos.tp2_price:
-            remaining_size = pos.size * 0.5
-            if pos.direction == "LONG":
-                pnl = (close_price - pos.entry_price) * remaining_size
-            else:
-                pnl = (pos.entry_price - close_price) * remaining_size
-
         sl_dist = abs(pos.entry_price - pos.sl_price)
         r_multiple = (pnl / pos.size / sl_dist) if sl_dist > 1e-10 and pos.size > 1e-10 else 0.0
 
         pos.pnl = pnl
-        pos.status = reason if reason in ("TP1", "TP2") else reason
+        pos.status = reason
         pos.close_time = now
         pos.close_price = close_price
 
@@ -339,6 +352,7 @@ class ExecutionEngine:
             duration_seconds=duration,
             r_multiple=r_multiple,
             confidence=pos.confidence,
+            reserved_risk=pos.reserved_risk,
         )
 
         await self._db.insert_trade_result(result)
@@ -348,11 +362,11 @@ class ExecutionEngine:
             asyncio.create_task(cb(result))
 
     async def _record_trade(self, pos: Position, price: float,
-                             reason: str, pnl: float, size_fraction: float) -> None:
+                            reason: str, pnl: float, size_fraction: float) -> None:
         """Record partial close (TP1 partial)."""
         sl_dist = abs(pos.entry_price - pos.sl_price)
-        effective_size = pos.size * size_fraction
-        r = (pnl / effective_size / sl_dist) if sl_dist > 1e-10 and effective_size > 1e-10 else 0.0
+        effective_size = pos.size / size_fraction  # Original size before reduction
+        r = (pnl / pos.size / sl_dist) if sl_dist > 1e-10 and pos.size > 1e-10 else 0.0
         duration = (datetime.now(timezone.utc) - pos.open_time).total_seconds()
 
         result = TradeResult(
@@ -362,12 +376,13 @@ class ExecutionEngine:
             direction=pos.direction,
             entry_price=pos.entry_price,
             exit_price=price,
-            size=effective_size,
+            size=pos.size,
             pnl=pnl,
             exit_reason=f"{reason}_PARTIAL",
             duration_seconds=duration,
             r_multiple=r,
             confidence=pos.confidence,
+            reserved_risk=pos.reserved_risk * size_fraction,
         )
         await self._db.insert_trade_result(result)
         await self._rm.on_trade_closed(result)
@@ -397,6 +412,7 @@ class ExecutionEngine:
                 expiry=datetime.fromtimestamp(
                     row["expiry"] / 1000, tz=timezone.utc
                 ) if row["expiry"] else None,
+                reserved_risk=float(row.get("reserved_risk", 0)),
             )
             self._positions[pos.id] = pos
         logger.info(f"Loaded {len(self._positions)} open positions from DB")
@@ -404,7 +420,7 @@ class ExecutionEngine:
     # ─── Queries ─────────────────────────────────────────────
 
     def get_open_positions(self) -> List[Position]:
-        return [p for p in self._positions.values() if p.status == "OPEN" or p.status == "TP1_HIT"]
+        return [p for p in self._positions.values() if p.is_open]
 
     def get_position_count(self) -> int:
         return len([p for p in self._positions.values() if p.is_open])
@@ -414,6 +430,9 @@ class ExecutionEngine:
         for pos in list(self._positions.values()):
             if pos.is_open:
                 price = self._de.get_current_price(pos.symbol)
-                if price > 0:
-                    await self._close_position(pos, price, reason)
+                # FIX: Close even if price=0, use entry price as fallback
+                if price <= 0:
+                    price = pos.entry_price
+                    logger.warning(f"Price unavailable for {pos.symbol}, using entry price for emergency close")
+                await self._close_position(pos, price, reason)
         logger.warning(f"All positions closed: {reason}")
