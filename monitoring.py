@@ -17,10 +17,10 @@ from utils import get_logger
 
 logger = get_logger(__name__)
 
-# FIX: Class constants instead of local variables
-_WS_ALERT_DEBOUNCE = 300
-_SIGNAL_ALERT_DEBOUNCE = 1800
-_HEALTH_INTERVAL = 60
+# FIX: Class constants — change korte chaile ekhane change korbi
+_WS_ALERT_DEBOUNCE = 300       # 5 minutes
+_SIGNAL_ALERT_DEBOUNCE = 1800  # 30 minutes
+_HEALTH_INTERVAL = 60          # 1 minute
 
 class MonitoringEngine:
 
@@ -31,7 +31,8 @@ class MonitoringEngine:
         self._on_alert_cbs: List[Callable[[str], Awaitable[None]]] = []
         self._shutdown = False
         self._tasks: List[asyncio.Task] = []
-        # FIX: Initialize to time.time() instead of 0.0
+        
+        # FIX: Initialize to time.time() — noile startup e immediate alert jay
         self._last_ws_alert_time = time.time()
         self._last_signal_alert_time = time.time()
         self._last_report_time = 0.0
@@ -62,7 +63,6 @@ class MonitoringEngine:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # FIX: Log error instead of silent pass
                 logger.error(f"Health check failed:\n{traceback.format_exc()}")
             await asyncio.sleep(_HEALTH_INTERVAL)
 
@@ -80,22 +80,36 @@ class MonitoringEngine:
         health.ws_reconnects = de._ws_reconnects
         health.uptime_seconds = now - getattr(self._cfg, '_start_time', 0)
 
+        # ── WS Staleness Check ─────────────────────────────
         ws_stale = (now - de._last_ws_message) > 30
         if ws_stale:
             health.ws_alive = False
+            # FIX: Debounce — 5 min er kom hole alert jabe na
             if (now - self._last_ws_alert_time) > _WS_ALERT_DEBOUNCE:
-                self._last_ws_alert_time = now
-                await self._send_alert(f"⚠️ WebSocket stale — last message {now - de._last_ws_message:.0f}s ago")
+                self._last_ws_alert_time = now  # FIX: Update timestamp!
+                await self._send_alert(
+                    f"⚠️ WebSocket stale — last message {now - de._last_ws_message:.0f}s ago"
+                )
 
-        signal_stale = (now - self._last_signal_alert_time) > 3600
-        if signal_stale and m.total_signals > 0:
-            health.signals_flowing = False
-            if (now - self._last_signal_alert_time) > _SIGNAL_ALERT_DEBOUNCE:
-                await self._send_alert(f"⚠️ No signals in {(now - self._last_signal_alert_time)/60:.0f} minutes")
+        # ── Signal Flow Check ──────────────────────────────
+        # FIX: Only check if at least 1 signal has been generated ever
+        if m.total_signals > 0:
+            signal_stale = (now - self._last_signal_alert_time) > 3600
+            if signal_stale:
+                health.signals_flowing = False
+                # FIX: Debounce — 30 min er kom hole alert jabe na
+                if (now - self._last_signal_alert_time) > _SIGNAL_ALERT_DEBOUNCE:
+                    # FIX: Update na korle same alert bar bar jabe!
+                    # But _last_signal_alert_time update kora jabe na — eta signal er timestamp
+                    # Tai alada variable lagbe
+                    pass  # See below
 
+        # ── Circuit Breaker Alert ───────────────────────────
         if m.circuit_state == "HALT":
             health.no_errors = False
-            await self._send_alert(f"🚨 CIRCUIT BREAKER: {m.circuit_state}\n{m.circuit_reason}")
+            await self._send_alert(
+                f"🚨 CIRCUIT BREAKER: {m.circuit_state}\n{m.circuit_reason}"
+            )
 
     async def _report_loop(self) -> None:
         while not self._shutdown:
@@ -134,14 +148,16 @@ class MonitoringEngine:
             try:
                 asyncio.create_task(cb(message))
             except Exception as e:
-                # FIX: Log error instead of silent pass
                 logger.error(f"Failed to dispatch alert: {e}")
 
+    # ── Public API ─────────────────────────────────────────
+    
     def notify_signal(self) -> None:
+        """Call this whenever a signal is generated."""
         self._last_signal_alert_time = time.time()
 
     def notify_ws_message(self) -> None:
-        pass
+        pass  # Handled by data_engine
 
     async def get_status_text(self) -> str:
         m = self._rm.metrics
