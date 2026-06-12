@@ -25,11 +25,11 @@ from utils import get_logger
 
 logger = get_logger(__name__)
 
-# Pre-filter thresholds  ── FIX: শিথিল করা হয়েছে, আগে signal আসছিল না
-_MAX_SPREAD_PCT   = 0.002   # 0.1% → 0.2%  (tight spread requirement শিথিল)
-_MIN_VOLUME_RATIO = 1.0     # 1.2  → 1.0   (volume surge requirement সরানো হয়েছে)
-_MIN_ATR_PCT      = 0.0005  # 0.1% → 0.05% (dead market threshold কমানো হয়েছে)
-_MIN_CONFIDENCE   = 0.52    # 0.55 → 0.52  (confidence gate সামান্য শিথিল)
+# Pre-filter thresholds
+_MAX_SPREAD_PCT  = 0.001    # 0.1%
+_MIN_VOLUME_RATIO = 1.2
+_MIN_ATR_PCT     = 0.001    # 0.1% (skip dead markets)
+_MIN_CONFIDENCE  = 0.55     # After ML adjustment
 _SIGNAL_COOLDOWN_MS = 180_000  # 3-minute cooldown per symbol+strategy
 
 # Strategy name → class mapping
@@ -134,25 +134,16 @@ class SignalEngine:
         candidates: List[Signal] = []
 
         # ── Pre-filters ───────────────────────────────────────
-        # FIX: volume filter — ratio == 1.0 মানে data নেই (default), সেটাও pass করবে
-        # spread 0.0 হলেও pass (কিছু exchange-এ spread সবসময় 0 থাকে)
-        spread_ok = data.spread_pct <= _MAX_SPREAD_PCT or data.spread_pct == 0.0
-        volume_ok = data.volume_ratio >= _MIN_VOLUME_RATIO  # এখন 1.0, তাই সবসময় pass
-        atr_ok    = self._atr_pct(data) >= _MIN_ATR_PCT
-
         filter_results = {
-            "spread": spread_ok,
-            "volume": volume_ok,
-            "atr":    atr_ok,
+            "spread": data.spread_pct < _MAX_SPREAD_PCT,
+            "volume": data.volume_ratio >= _MIN_VOLUME_RATIO or data.volume_ratio == 1.0,
+            "atr":    self._atr_pct(data) >= _MIN_ATR_PCT,
         }
 
         if not all(filter_results.values()):
             logger.debug(
                 f"{symbol} pre-filter failed: "
-                + ", ".join(
-                    f"{k}={getattr(data, k, '?') if k != 'atr' else f'{self._atr_pct(data):.5f}'}"
-                    for k, v in filter_results.items() if not v
-                )
+                + ", ".join(k for k, v in filter_results.items() if not v)
             )
             return []
 
