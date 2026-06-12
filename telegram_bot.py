@@ -5,7 +5,7 @@ Alerts, commands, and status queries.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Awaitable, List, Optional
 
 from telegram import Update
@@ -17,7 +17,7 @@ from telegram.ext import (
 
 from config import Config
 from database import Database
-from models import Position, Regime, Signal, TradeResult
+from models import Position, RegimeSignal, Signal, TradeResult
 from utils import get_logger
 
 logger = get_logger(__name__)
@@ -48,6 +48,7 @@ class TelegramBot:
 
         # Register commands
         self._app.add_handler(CommandHandler("start", self._cmd_start))
+        self._app.add_handler(CommandHandler("help", self._cmd_start))  # FIX: Add /help
         self._app.add_handler(CommandHandler("status", self._cmd_status))
         self._app.add_handler(CommandHandler("balance", self._cmd_balance))
         self._app.add_handler(CommandHandler("signals", self._cmd_signals))
@@ -113,20 +114,34 @@ class TelegramBot:
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._status_provider:
-            msg = await self._status_provider()
+            try:
+                msg = await self._status_provider()
+            except Exception as e:
+                logger.error(f"Status provider error: {e}")
+                msg = "⚠️ Error fetching status"
         else:
             msg = "Status not available"
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def _cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._balance_provider:
-            msg = await self._balance_provider()
+            try:
+                msg = await self._balance_provider()
+            except Exception as e:
+                logger.error(f"Balance provider error: {e}")
+                msg = "⚠️ Error fetching balance"
         else:
             msg = "Balance not available"
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def _cmd_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        rows = await self._db.get_recent_signals(limit=5)
+        try:
+            rows = await self._db.get_recent_signals(limit=5)
+        except Exception as e:
+            logger.error(f"Signals DB error: {e}")
+            await update.message.reply_text("⚠️ Error fetching signals")
+            return
+            
         if not rows:
             await update.message.reply_text("📡 No recent signals")
             return
@@ -141,7 +156,13 @@ class TelegramBot:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def _cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        rows = await self._db.get_recent_trades(limit=5)
+        try:
+            rows = await self._db.get_recent_trades(limit=5)
+        except Exception as e:
+            logger.error(f"Trades DB error: {e}")
+            await update.message.reply_text("⚠️ Error fetching trades")
+            return
+            
         if not rows:
             await update.message.reply_text("📋 No closed trades")
             return
@@ -158,7 +179,11 @@ class TelegramBot:
 
     async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._positions_provider:
-            msg = await self._positions_provider()
+            try:
+                msg = await self._positions_provider()
+            except Exception as e:
+                logger.error(f"Positions provider error: {e}")
+                msg = "⚠️ Error fetching positions"
         else:
             msg = "Positions not available"
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -178,29 +203,45 @@ class TelegramBot:
 
     async def _cmd_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._report_provider:
-            msg = await self._report_provider()
+            try:
+                msg = await self._report_provider()
+            except Exception as e:
+                logger.error(f"Report provider error: {e}")
+                msg = "⚠️ Error fetching report"
         else:
             msg = "Report not available"
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._on_pause:
-            await self._on_pause()
-            await update.message.reply_text("⏸️ Paused")
+            try:
+                await self._on_pause()
+                await update.message.reply_text("⏸️ Paused")
+            except Exception as e:
+                logger.error(f"Pause error: {e}")
+                await update.message.reply_text("⚠️ Error pausing")
         else:
             await update.message.reply_text("Pause not wired")
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._on_resume:
-            await self._on_resume()
-            await update.message.reply_text("▶️ Resumed")
+            try:
+                await self._on_resume()
+                await update.message.reply_text("▶️ Resumed")
+            except Exception as e:
+                logger.error(f"Resume error: {e}")
+                await update.message.reply_text("⚠️ Error resuming")
         else:
             await update.message.reply_text("Resume not wired")
 
     async def _cmd_halt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._on_halt:
-            await self._on_halt()
-            await update.message.reply_text("🛑 Emergency halt triggered")
+            try:
+                await self._on_halt()
+                await update.message.reply_text("🛑 Emergency halt triggered")
+            except Exception as e:
+                logger.error(f"Halt error: {e}")
+                await update.message.reply_text("⚠️ Error triggering halt")
         else:
             await update.message.reply_text("Halt not wired")
 
@@ -216,11 +257,15 @@ class TelegramBot:
                     parse_mode="Markdown",
                 )
             except Exception as e:
+                # FIX: Log error instead of silent failure
                 logger.error(f"Telegram send error: {e}")
+        else:
+            logger.warning("Telegram not configured — message dropped")
 
     async def alert_signal(self, sig: Signal) -> None:
         icon = "🟢" if sig.direction == "LONG" else "🔴"
         ist_time = self._get_ist_time(sig.timestamp)
+        # FIX: Use ml_score instead of ml_confidence, atr instead of estimated_hold
         msg = (
             f"🚨 *KAVACH-07 SIGNAL*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -238,8 +283,8 @@ class TelegramBot:
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📋 R/R: {abs(sig.tp1_price - sig.entry_price) / abs(sig.entry_price - sig.sl_price):.1f}R\n"
             f"⚡ Risk: {sig.risk_pct*100:.2f}%\n"
-            f"🤖 ML: {sig.ml_confidence:.0%}\n"
-            f"⏱️ Hold Time: {sig.estimated_hold}\n"
+            f"🤖 ML: {sig.ml_score:.0%}\n"
+            f"📊 ATR: {sig.atr:.6g}\n"
             f"🕐 IST: {ist_time}"
         )
         await self.send(msg)
@@ -268,14 +313,15 @@ class TelegramBot:
         )
         await self.send(msg)
 
-    async def alert_regime(self, regime: Regime) -> None:
+    async def alert_regime(self, regime: RegimeSignal) -> None:
         icon = "🌊" if regime.bias == "NEUTRAL" else ("🐂" if regime.bias == "BULLISH" else "🐻")
         ist_time = self._get_ist_time(regime.timestamp)
+        # FIX: Use position_multiplier instead of size_multiplier
         msg = (
             f"📊 *KAVACH-07 REGIME*\n"
             f"{icon} Global Filter: {regime.bias}\n"
             f"Confidence: {regime.confidence:.0%}\n"
-            f"Size multiplier: {regime.size_multiplier:.1f}x\n"
+            f"Size multiplier: {regime.position_multiplier:.1f}x\n"
             f"🕐 IST: {ist_time}"
         )
         await self.send(msg)
@@ -288,22 +334,15 @@ class TelegramBot:
     # ─── Helpers ─────────────────────────────────────────────
 
     @staticmethod
-    def _get_ist_time(utc_dt: datetime) -> str:
-        """Convert UTC datetime to IST string."""
-        if utc_dt is None:
-            utc_dt = datetime.now(timezone.utc)
-        ist = utc_dt.astimezone(timezone(timedelta(hours=5, minutes=30)))
-        return ist.strftime("%Y-%m-%d %H:%M IST")
-
-    @staticmethod
     def _get_ist_time(ts) -> str:
-        """Handle various timestamp types."""
+        """Convert various timestamp types to IST string."""
         if ts is None:
             ts = datetime.now(timezone.utc)
         if isinstance(ts, str):
             try:
                 ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            except:
+            except (ValueError, AttributeError):
+                # FIX: Specific exceptions instead of bare except
                 ts = datetime.now(timezone.utc)
         if isinstance(ts, datetime):
             ist = ts.astimezone(timezone(timedelta(hours=5, minutes=30)))
