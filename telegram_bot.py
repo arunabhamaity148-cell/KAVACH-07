@@ -1,19 +1,19 @@
 """
 KAVACH-07 — Telegram Bot
-Alerts, commands, and status queries.
+Signal alerts, regime updates, commands (/status /balance /signals etc).
+Async. Retry logic. Rate-limited to avoid flooding.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Callable, Awaitable, List, Optional
+import traceback
+from datetime import datetime, timezone
+from typing import Optional
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram import Bot, Update
+from telegram.constants import ParseMode
+from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 from config import Config
 from database import Database
@@ -22,329 +22,333 @@ from utils import get_logger
 
 logger = get_logger(__name__)
 
-# ─────────────────────────────────────────────────────────────
+_MAX_MSG_LEN  = 4096
+_RETRY_DELAY  = 3      # seconds before retrying failed send
+_MAX_RETRIES  = 5
+_RATE_DELAY   = 0.5    # min seconds between messages
+
 
 class TelegramBot:
 
     def __init__(self, config: Config, db: Database):
         self._cfg = config
         self._db = db
+        self._bot: Optional[Bot] = None
         self._app: Optional[Application] = None
-        self._handlers_registered = False
+        self._chat_id = config.TELEGRAM_CHAT_ID
+        self._enabled = bool(config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID)
 
-        # Callbacks wired by main.py
-        self._on_pause: Optional[Callable[[], Awaitable[None]]] = None
-        self._on_resume: Optional[Callable[[], Awaitable[None]]] = None
-        self._on_halt: Optional[Callable[[], Awaitable[None]]] = None
-        self._status_provider: Optional[Callable[[], Awaitable[str]]] = None
-        self._balance_provider: Optional[Callable[[], Awaitable[str]]] = None
-        self._positions_provider: Optional[Callable[[], Awaitable[str]]] = None
-        self._report_provider: Optional[Callable[[], Awaitable[str]]] = None
+        # Rate limit: track last send time
+        self._last_send: float = 0.0
+        self._send_lock = asyncio.Lock()
+
+        # Callbacks for commands (wired in main.py)
+        self._on_pause: Optional[callable] = None
+        self._on_resume: Optional[callable] = None
+        self._on_halt: Optional[callable] = None
+        self._status_provider: Optional[callable] = None
+        self._balance_provider: Optional[callable] = None
+        self._signals_provider: Optional[callable] = None
+        self._trades_provider: Optional[callable] = None
+        self._positions_provider: Optional[callable] = None
+        self._config_provider: Optional[callable] = None
+        self._report_provider: Optional[callable] = None
 
     # ─── Lifecycle ───────────────────────────────────────────
 
     async def start(self) -> None:
-        self._app = Application.builder().token(self._cfg.TELEGRAM_BOT_TOKEN).build()
+        if not self._enabled:
+            logger.warning("Telegram not configured — alerts disabled")
+            return
 
-        # Register commands
-        self._app.add_handler(CommandHandler("start", self._cmd_start))
-        self._app.add_handler(CommandHandler("help", self._cmd_start))  # FIX: Add /help
-        self._app.add_handler(CommandHandler("status", self._cmd_status))
-        self._app.add_handler(CommandHandler("balance", self._cmd_balance))
-        self._app.add_handler(CommandHandler("signals", self._cmd_signals))
-        self._app.add_handler(CommandHandler("trades", self._cmd_trades))
-        self._app.add_handler(CommandHandler("positions", self._cmd_positions))
-        self._app.add_handler(CommandHandler("config", self._cmd_config))
-        self._app.add_handler(CommandHandler("report", self._cmd_report))
-        self._app.add_handler(CommandHandler("pause", self._cmd_pause))
-        self._app.add_handler(CommandHandler("resume", self._cmd_resume))
-        self._app.add_handler(CommandHandler("halt", self._cmd_halt))
+        self._app = (
+            Application.builder()
+            .token(self._cfg.TELEGRAM_BOT_TOKEN)
+            .build()
+        )
+        self._bot = self._app.bot
+
+        # Register command handlers
+        handlers = [
+            ("start",     self._cmd_start),
+            ("status",    self._cmd_status),
+            ("balance",   self._cmd_balance),
+            ("signals",   self._cmd_signals),
+            ("trades",    self._cmd_trades),
+            ("positions", self._cmd_positions),
+            ("pause",     self._cmd_pause),
+            ("resume",    self._cmd_resume),
+            ("halt",      self._cmd_halt),
+            ("report",    self._cmd_report),
+            ("config",    self._cmd_config),
+        ]
+        for name, handler in handlers:
+            self._app.add_handler(CommandHandler(name, handler))
 
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
 
+        await self.send("🚀 *KAVACH-07 ONLINE*\nSignal bot started successfully.", parse_md=True)
         logger.info("Telegram bot started")
 
     async def stop(self) -> None:
-        if self._app:
+        if not self._enabled or not self._app:
+            return
+        try:
+            await self.send("🛑 KAVACH-07 shutting down.")
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
-            logger.info("Telegram bot stopped")
+        except Exception:
+            pass
 
-    # ─── Handler wiring ──────────────────────────────────────
+    # ─── Alert senders ───────────────────────────────────────
 
-    def register_handlers(
-        self,
-        on_pause: Callable[[], Awaitable[None]],
-        on_resume: Callable[[], Awaitable[None]],
-        on_halt: Callable[[], Awaitable[None]],
-        status_provider: Callable[[], Awaitable[str]],
-        balance_provider: Callable[[], Awaitable[str]],
-        positions_provider: Callable[[], Awaitable[str]],
-        report_provider: Callable[[], Awaitable[str]],
-    ) -> None:
-        self._on_pause = on_pause
-        self._on_resume = on_resume
-        self._on_halt = on_halt
-        self._status_provider = status_provider
-        self._balance_provider = balance_provider
-        self._positions_provider = positions_provider
-        self._report_provider = report_provider
-        self._handlers_registered = True
-
-    # ─── Commands ────────────────────────────────────────────
-
-    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text(
-            "🛡️ *KAVACH-07 Bot*\n\n"
-            "/status — Bot health\n"
-            "/balance — P&L, drawdown, win rate\n"
-            "/signals — Last 5 signals\n"
-            "/trades — Last 5 closed trades\n"
-            "/positions — Open positions\n"
-            "/config — Current settings\n"
-            "/report — Hourly report\n"
-            "/pause — Pause signals\n"
-            "/resume — Resume signals\n"
-            "/halt — Emergency stop",
-            parse_mode="Markdown",
-        )
-
-    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._status_provider:
-            try:
-                msg = await self._status_provider()
-            except Exception as e:
-                logger.error(f"Status provider error: {e}")
-                msg = "⚠️ Error fetching status"
-        else:
-            msg = "Status not available"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def _cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._balance_provider:
-            try:
-                msg = await self._balance_provider()
-            except Exception as e:
-                logger.error(f"Balance provider error: {e}")
-                msg = "⚠️ Error fetching balance"
-        else:
-            msg = "Balance not available"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def _cmd_signals(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            rows = await self._db.get_recent_signals(limit=5)
-        except Exception as e:
-            logger.error(f"Signals DB error: {e}")
-            await update.message.reply_text("⚠️ Error fetching signals")
-            return
-            
-        if not rows:
-            await update.message.reply_text("📡 No recent signals")
+    async def send(self, text: str, parse_md: bool = False) -> None:
+        """Send a message with retry and rate limiting."""
+        if not self._enabled or not self._bot:
             return
 
-        lines = ["📡 *Last 5 Signals*\n"]
-        for r in rows:
-            ts = self._get_ist_time(r.get("timestamp"))
-            lines.append(
-                f"{r['symbol']} {r['direction']} | {r['strategy']}\n"
-                f"Conf: {r['confidence']:.0%} | {ts}"
-            )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        async with self._send_lock:
+            # Rate limit
+            elapsed = asyncio.get_event_loop().time() - self._last_send
+            if elapsed < _RATE_DELAY:
+                await asyncio.sleep(_RATE_DELAY - elapsed)
 
-    async def _cmd_trades(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            rows = await self._db.get_recent_trades(limit=5)
-        except Exception as e:
-            logger.error(f"Trades DB error: {e}")
-            await update.message.reply_text("⚠️ Error fetching trades")
-            return
-            
-        if not rows:
-            await update.message.reply_text("📋 No closed trades")
-            return
+            # Truncate if needed
+            if len(text) > _MAX_MSG_LEN:
+                text = text[:_MAX_MSG_LEN - 20] + "\n...[truncated]"
 
-        lines = ["📋 *Last 5 Trades*\n"]
-        for r in rows:
-            icon = "✅" if r["pnl"] > 0 else "🔴"
-            ts = self._get_ist_time(r.get("close_time"))
-            lines.append(
-                f"{icon} {r['symbol']} {r['direction']} | {r['strategy']}\n"
-                f"PnL: `{r['pnl']:+.4f}` | R: `{r['r_multiple']:+.2f}R` | {ts}"
-            )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._positions_provider:
-            try:
-                msg = await self._positions_provider()
-            except Exception as e:
-                logger.error(f"Positions provider error: {e}")
-                msg = "⚠️ Error fetching positions"
-        else:
-            msg = "Positions not available"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def _cmd_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        cfg = self._cfg
-        mode = "TESTNET" if cfg.USE_TESTNET else "LIVE"
-        msg = (
-            f"⚙️ *Config*\n"
-            f"Mode: `{mode}`\n"
-            f"Pairs: {len(cfg.BASE_PAIRS)}\n"
-            f"Strategies: {len(cfg.STRATEGIES)}\n"
-            f"Risk: `{cfg.MAX_RISK_PER_TRADE*100:.1f}%/trade`\n"
-            f"Max DD halt: `{cfg.DRAWDOWN_HALT_THRESHOLD*100:.0f}%`"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def _cmd_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._report_provider:
-            try:
-                msg = await self._report_provider()
-            except Exception as e:
-                logger.error(f"Report provider error: {e}")
-                msg = "⚠️ Error fetching report"
-        else:
-            msg = "Report not available"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._on_pause:
-            try:
-                await self._on_pause()
-                await update.message.reply_text("⏸️ Paused")
-            except Exception as e:
-                logger.error(f"Pause error: {e}")
-                await update.message.reply_text("⚠️ Error pausing")
-        else:
-            await update.message.reply_text("Pause not wired")
-
-    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._on_resume:
-            try:
-                await self._on_resume()
-                await update.message.reply_text("▶️ Resumed")
-            except Exception as e:
-                logger.error(f"Resume error: {e}")
-                await update.message.reply_text("⚠️ Error resuming")
-        else:
-            await update.message.reply_text("Resume not wired")
-
-    async def _cmd_halt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._on_halt:
-            try:
-                await self._on_halt()
-                await update.message.reply_text("🛑 Emergency halt triggered")
-            except Exception as e:
-                logger.error(f"Halt error: {e}")
-                await update.message.reply_text("⚠️ Error triggering halt")
-        else:
-            await update.message.reply_text("Halt not wired")
-
-    # ─── Alerts ──────────────────────────────────────────────
-
-    async def send(self, message: str) -> None:
-        """Send raw message to Telegram chat."""
-        if self._app and self._cfg.TELEGRAM_CHAT_ID:
-            try:
-                await self._app.bot.send_message(
-                    chat_id=self._cfg.TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                # FIX: Log error instead of silent failure
-                logger.error(f"Telegram send error: {e}")
-        else:
-            logger.warning("Telegram not configured — message dropped")
+            for attempt in range(1, _MAX_RETRIES + 1):
+                try:
+                    await self._bot.send_message(
+                        chat_id=self._chat_id,
+                        text=text,
+                        parse_mode=ParseMode.MARKDOWN if parse_md else None,
+                        disable_web_page_preview=True,
+                    )
+                    self._last_send = asyncio.get_event_loop().time()
+                    return
+                except RetryAfter as e:
+                    logger.warning(f"Telegram rate limited — waiting {e.retry_after}s")
+                    await asyncio.sleep(e.retry_after + 1)
+                except (NetworkError, TimedOut) as e:
+                    if attempt < _MAX_RETRIES:
+                        await asyncio.sleep(_RETRY_DELAY * attempt)
+                    else:
+                        logger.error(f"Telegram send failed after {_MAX_RETRIES} retries: {e}")
+                except Exception as e:
+                    logger.error(f"Telegram unexpected error: {e}")
+                    return
 
     async def alert_signal(self, sig: Signal) -> None:
-        icon = "🟢" if sig.direction == "LONG" else "🔴"
-        ist_time = self._get_ist_time(sig.timestamp)
-        # FIX: Use ml_score instead of ml_confidence, atr instead of estimated_hold
-        msg = (
-            f"🚨 *KAVACH-07 SIGNAL*\n"
+        """Format and send a signal alert."""
+        icon = "🚨" if sig.strategy not in ("OB_IMBALANCE", "EXCHANGE_ARB") else "⚡"
+        if sig.strategy == "OI_BREAKOUT":
+            icon = "🚀"
+
+        dir_icon = "🟢" if sig.direction == "LONG" else "🔴"
+
+        tp2_line = f"\nTP2: {sig.tp2_price:.6g}" if sig.tp2_price else ""
+
+        text = (
+            f"{icon} *KAVACH-07 SIGNAL*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Pair: {sig.symbol}\n"
-            f"🎯 Strategy: {sig.strategy}\n"
-            f"{icon} Direction: {sig.direction}\n"
-            f"🎲 Confidence: {sig.confidence:.0%}\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 ENTRY\n"
-            f"`{sig.entry_price:.6g}`\n\n"
-            f"✅ TP1\n"
-            f"`{sig.tp1_price:.6g}`\n\n"
-            f"🛑 SL\n"
-            f"`{sig.sl_price:.6g}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📋 R/R: {abs(sig.tp1_price - sig.entry_price) / abs(sig.entry_price - sig.sl_price):.1f}R\n"
-            f"⚡ Risk: {sig.risk_pct*100:.2f}%\n"
-            f"🤖 ML: {sig.ml_score:.0%}\n"
-            f"📊 ATR: {sig.atr:.6g}\n"
-            f"🕐 IST: {ist_time}"
+            f"*Pair:* `{sig.symbol}`\n"
+            f"*Strategy:* `{sig.strategy}`\n"
+            f"*Direction:* {dir_icon} `{sig.direction}`\n"
+            f"*Confidence:* `{sig.confidence*100:.0f}%`\n"
+            f"\n"
+            f"*Entry:* `{sig.entry_price:.6g}` ({sig.entry_type})\n"
+            f"*SL:* `{sig.sl_price:.6g}`\n"
+            f"*TP1:* `{sig.tp1_price:.6g}` ({sig.r_ratio:.1f}R){tp2_line}\n"
+            f"\n"
+            f"*Rationale:*\n{sig.rationale}\n"
+            f"\n"
+            f"*Risk:* `{sig.risk_pct*100:.2f}%` | *ML:* `{sig.ml_score*100:.0f}%`\n"
+            f"*Time:* `{sig.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC`"
         )
-        await self.send(msg)
+        await self.send(text, parse_md=True)
 
     async def alert_trade_opened(self, pos: Position) -> None:
-        ist_time = self._get_ist_time(pos.open_time)
-        msg = (
+        dir_icon = "🟢" if pos.direction == "LONG" else "🔴"
+        text = (
             f"📋 *Position Opened*\n"
-            f"{'🟢' if pos.direction == 'LONG' else '🔴'} {pos.symbol} | {pos.direction} | {pos.strategy}\n"
-            f"Entry: `{pos.entry_price:.6g}` | Size: {pos.size:.4f}\n"
-            f"SL: `{pos.sl_price:.6g}` | TP1: `{pos.tp1_price:.6g}`\n"
-            f"🕐 IST: {ist_time}"
+            f"{dir_icon} {pos.symbol} | {pos.direction} | {pos.strategy}\n"
+            f"Entry: `{pos.entry_price:.6g}` | Size: `{pos.size:.4g}`\n"
+            f"SL: `{pos.sl_price:.6g}` | TP1: `{pos.tp1_price:.6g}`"
         )
-        await self.send(msg)
+        await self.send(text, parse_md=True)
 
     async def alert_trade_closed(self, result: TradeResult) -> None:
-        icon = "✅" if result.pnl > 0 else "🔴"
-        ist_time = self._get_ist_time(datetime.now(timezone.utc))
-        msg = (
-            f"{icon} *Trade Closed — {result.exit_reason}*\n"
+        pnl_icon = "✅" if result.pnl > 0 else "❌"
+        text = (
+            f"{pnl_icon} *Trade Closed — {result.exit_reason}*\n"
             f"{result.symbol} | {result.direction} | {result.strategy}\n"
             f"Entry: `{result.entry_price:.6g}` → Exit: `{result.exit_price:.6g}`\n"
             f"PnL: `{result.pnl:+.4f}` | R: `{result.r_multiple:+.2f}R`\n"
-            f"Duration: {result.duration_seconds/3600:.1f}h\n"
-            f"🕐 IST: {ist_time}"
+            f"Duration: `{result.duration_seconds/3600:.1f}h`"
         )
-        await self.send(msg)
+        await self.send(text, parse_md=True)
 
     async def alert_regime(self, regime: RegimeSignal) -> None:
-        icon = "🌊" if regime.bias == "NEUTRAL" else ("🐂" if regime.bias == "BULLISH" else "🐻")
-        ist_time = self._get_ist_time(regime.timestamp)
-        # FIX: Use position_multiplier instead of size_multiplier
-        msg = (
+        icon = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(regime.bias, "⚪")
+        text = (
             f"📊 *KAVACH-07 REGIME*\n"
-            f"{icon} Global Filter: {regime.bias}\n"
-            f"Confidence: {regime.confidence:.0%}\n"
-            f"Size multiplier: {regime.position_multiplier:.1f}x\n"
-            f"🕐 IST: {ist_time}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Global Filter: {icon} `{regime.bias}`\n"
+            f"Confidence: `{regime.confidence*100:.0f}%`\n"
+            f"\n"
+            f"*Rationale:*\n"
+            f"• Avg Funding: `{regime.avg_funding*100:.4f}%`\n"
+            f"• OI Trend: `{regime.oi_trend*100:+.1f}%`\n"
+            f"\n"
+            f"Impact: Size multiplier `{regime.position_multiplier:.1f}x`\n"
+            f"Time: `{regime.timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC`"
         )
-        await self.send(msg)
+        await self.send(text, parse_md=True)
 
     async def alert_circuit_breaker(self, state: str, reason: str) -> None:
         icon = "🚨" if state == "HALT" else "⚠️"
-        ist_time = self._get_ist_time(datetime.now(timezone.utc))
-        await self.send(f"{icon} CIRCUIT BREAKER: {state}\n{reason}\n🕐 IST: {ist_time}")
+        await self.send(f"{icon} *CIRCUIT BREAKER: {state}*\n{reason}", parse_md=True)
 
-    # ─── Helpers ─────────────────────────────────────────────
+    # ─── Command handlers ─────────────────────────────────────
 
-    @staticmethod
-    def _get_ist_time(ts) -> str:
-        """Convert various timestamp types to IST string."""
-        if ts is None:
-            ts = datetime.now(timezone.utc)
-        if isinstance(ts, str):
-            try:
-                ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            except (ValueError, AttributeError):
-                # FIX: Specific exceptions instead of bare except
-                ts = datetime.now(timezone.utc)
-        if isinstance(ts, datetime):
-            ist = ts.astimezone(timezone(timedelta(hours=5, minutes=30)))
-            return ist.strftime("%Y-%m-%d %H:%M IST")
-        return str(ts)
+    def _auth(self, update: Update) -> bool:
+        """Only respond to the configured chat."""
+        return str(update.effective_chat.id) == str(self._chat_id)
+
+    async def _cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        text = (
+            "🤖 *KAVACH-07 Signal Bot*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Available commands:\n"
+            "/status — System health\n"
+            "/balance — Balance & P&L\n"
+            "/signals — Last 5 signals\n"
+            "/trades — Last 5 trades\n"
+            "/positions — Open positions\n"
+            "/pause — Pause new signals\n"
+            "/resume — Resume signals\n"
+            "/halt — Emergency halt\n"
+            "/report — Force hourly report\n"
+            "/config — Show config"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._status_provider:
+            text = await self._status_provider()
+        else:
+            text = "Status provider not registered"
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_balance(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._balance_provider:
+            text = await self._balance_provider()
+        else:
+            text = "Balance provider not registered"
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_signals(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        sigs = await self._db.get_recent_signals(limit=5)
+        if not sigs:
+            await update.message.reply_text("No signals yet.")
+            return
+        lines = ["📡 *Last 5 Signals*\n"]
+        for s in sigs:
+            ts = datetime.fromtimestamp(s["timestamp"] / 1000, tz=timezone.utc)
+            lines.append(
+                f"• {s['symbol']} {s['direction']} | {s['strategy']}\n"
+                f"  Conf: {s['confidence']*100:.0f}% | "
+                f"{ts.strftime('%m-%d %H:%M')} UTC\n"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_trades(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        trades = await self._db.get_recent_trades(limit=5)
+        if not trades:
+            await update.message.reply_text("No trades yet.")
+            return
+        lines = ["📊 *Last 5 Trades*\n"]
+        for t in trades:
+            pnl_icon = "✅" if t["pnl"] > 0 else "❌"
+            lines.append(
+                f"{pnl_icon} {t['symbol']} {t['direction']} | "
+                f"PnL: {t['pnl']:+.4f} | {t['exit_reason']}\n"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._positions_provider:
+            text = await self._positions_provider()
+        else:
+            text = "Positions provider not registered"
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def _cmd_pause(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._on_pause:
+            await self._on_pause()
+        await update.message.reply_text("⏸️ Signal generation paused.")
+
+    async def _cmd_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._on_resume:
+            await self._on_resume()
+        await update.message.reply_text("▶️ Signal generation resumed.")
+
+    async def _cmd_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._on_halt:
+            await self._on_halt()
+        await update.message.reply_text(
+            "🚨 Emergency halt activated. Use /resume to re-enable."
+        )
+
+    async def _cmd_report(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        if self._report_provider:
+            text = await self._report_provider()
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("Report provider not registered")
+
+    async def _cmd_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update):
+            return
+        cfg = self._cfg
+        text = (
+            f"⚙️ *KAVACH-07 Config*\n"
+            f"Mode: `{'TESTNET' if cfg.USE_TESTNET else 'LIVE'}`\n"
+            f"Pairs: `{len(cfg.BASE_PAIRS)}`\n"
+            f"Strategies: `{len(cfg.STRATEGIES)}`\n"
+            f"Risk/trade: `{cfg.MAX_RISK_PER_TRADE*100:.2f}%`\n"
+            f"Max exposure: `{cfg.MAX_TOTAL_EXPOSURE*100:.1f}%`\n"
+            f"ML threshold: `{cfg.ML_CONFIDENCE_THRESHOLD}`\n"
+            f"Scan interval: `{cfg.SCAN_INTERVAL}s`"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    # ─── Callback registration ────────────────────────────────
+
+    def register_handlers(self, **kwargs) -> None:
+        for k, v in kwargs.items():
+            setattr(self, f"_{k}", v)
