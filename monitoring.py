@@ -1,102 +1,59 @@
 """
 KAVACH-07 — Monitoring Engine
-Health checks, metrics aggregation, hourly reports.
-Tracks memory, WS liveness, signal flow, error rate.
 """
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import traceback
-from datetime import datetime, timezone
-from typing import Optional, Callable, Awaitable
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Awaitable, Dict, List, Optional
 
 from config import Config
 from data_engine import DataEngine
-from database import Database
-from ml_engine import MLEngine
-from models import HealthStatus
+from models import HealthStatus, RiskMetrics
 from risk_manager import RiskManager
 from utils import get_logger
 
 logger = get_logger(__name__)
 
-_WS_STALE_SECONDS   = 120   # No WS msg for 2 min → unhealthy
-_DATA_STALE_SECONDS = 60    # Data not updated for 60s → unhealthy
-_SIGNAL_STALE_HOURS = 4     # FIX: 2h → 4h  (বাজার quiet থাকলে 2h signal না আসতেই পারে)
-_HEALTH_INTERVAL    = 30    # Health check every 30 seconds
-_REPORT_INTERVAL    = 3600  # Hourly report
-
-# FIX: debounce constant গুলো class-level এ তুলে আনা হয়েছে
-# আগে __init__ এর ভেতরে local variable ছিল — ফলে _run_health_check() এ দেখাই যেত না!
-# সেজন্যই debounce কাজ করছিল না এবং প্রতি ৩০ সেকেন্ডে alert যাচ্ছিল।
-_WS_ALERT_DEBOUNCE     = 300   # min 5 min between WS stale alerts
-_SIGNAL_ALERT_DEBOUNCE = 3600  # FIX: 30min → 60min between no-signal alerts
-
+# FIX: Class constants instead of local variables
+_WS_ALERT_DEBOUNCE = 300
+_SIGNAL_ALERT_DEBOUNCE = 1800
+_HEALTH_INTERVAL = 60
 
 class MonitoringEngine:
 
-    def __init__(self, config: Config, data_engine: DataEngine,
-                 db: Database, risk_manager: RiskManager, ml_engine: MLEngine):
+    def __init__(self, config: Config, data_engine: DataEngine, risk_manager: RiskManager):
         self._cfg = config
         self._de = data_engine
-        self._db = db
         self._rm = risk_manager
-        self._ml = ml_engine
-
-        self._health = HealthStatus()
-        self._start_time = time.time()
-
-        # Error tracking
-        self._error_count = 0
-
-        # Signal tracking
-        self._last_signal_time: float = time.time()
-
-        # FIX: debounce tracker গুলো instance variable হিসেবে রাখা হয়েছে
-        # (আগে __init__-এ local variable ছিল, তাই _run_health_check-এ access হতো না)
-        self._last_ws_alert_time: float = 0.0
-        self._last_signal_alert_time: float = 0.0
-
-        # Circuit breaker change detection
-        self._last_circuit_state: str = "OK"
-
-        # Callbacks
-        self._on_alert_cbs: list = []
-
-        self._tasks: list = []
+        self._on_alert_cbs: List[Callable[[str], Awaitable[None]]] = []
         self._shutdown = False
-
-    # ─── Lifecycle ───────────────────────────────────────────
+        self._tasks: List[asyncio.Task] = []
+        # FIX: Initialize to time.time() instead of 0.0
+        self._last_ws_alert_time = time.time()
+        self._last_signal_alert_time = time.time()
+        self._last_report_time = 0.0
+        self._last_midnight_reset = 0.0
 
     async def start(self) -> None:
         self._tasks = [
-            asyncio.create_task(self._health_loop(), name="health_loop"),
-            asyncio.create_task(self._report_loop(), name="report_loop"),
-            asyncio.create_task(self._midnight_reset_loop(), name="midnight_reset"),
-            asyncio.create_task(self._cleanup_loop(), name="db_cleanup"),
+            asyncio.create_task(self._health_loop(), name="health"),
+            asyncio.create_task(self._report_loop(), name="report"),
+            asyncio.create_task(self._midnight_reset_loop(), name="midnight"),
         ]
         logger.info("MonitoringEngine started")
 
     async def stop(self) -> None:
         self._shutdown = True
-        for t in self._tasks:
-            t.cancel()
+        for task in self._tasks:
+            task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        logger.info("MonitoringEngine stopped")
 
     def on_alert(self, cb: Callable[[str], Awaitable[None]]) -> None:
         self._on_alert_cbs.append(cb)
-
-    def notify_signal(self) -> None:
-        self._last_signal_time = time.time()
-
-    def notify_error(self, component: str, msg: str, tb: str = "") -> None:
-        self._error_count += 1
-        self._health.error_count = self._error_count
-        asyncio.create_task(self._db.log_error(component, msg, tb))
-
-    # ─── Health Check ─────────────────────────────────────────
 
     async def _health_loop(self) -> None:
         while not self._shutdown:
@@ -105,216 +62,114 @@ class MonitoringEngine:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                pass
+                # FIX: Log error instead of silent pass
+                logger.error(f"Health check failed:\n{traceback.format_exc()}")
             await asyncio.sleep(_HEALTH_INTERVAL)
 
     async def _run_health_check(self) -> None:
-        h = self._health
         now = time.time()
+        de = self._de
+        rm = self._rm
+        m = rm.metrics
 
-        h.ws_alive        = (now - self._de.last_ws_msg) < _WS_STALE_SECONDS
-        h.data_fresh      = h.ws_alive   # Data freshness tied to WS liveness
-        h.signals_flowing = (now - self._last_signal_time) < _SIGNAL_STALE_HOURS * 3600
-        h.no_errors       = self._error_count < 20
-        h.uptime_seconds  = now - self._start_time
-        h.ws_reconnects   = self._de.ws_reconnects
-        h.error_count     = self._error_count
+        health = HealthStatus()
+        health.last_ws_message = de._last_ws_message
+        health.last_signal_time = self._last_signal_alert_time
+        health.last_data_update = time.time()
+        health.error_count = 0
+        health.ws_reconnects = de._ws_reconnects
+        health.uptime_seconds = now - getattr(self._cfg, '_start_time', 0)
 
-        # Memory tracking
-        try:
-            import resource
-            mem = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # MB
-            h.memory_mb = mem
-            if mem > 500:
-                logger.warning(f"Memory usage high: {mem:.0f} MB")
-        except Exception:
-            pass
-
-        # Alert on problems — debounced to prevent Telegram spam
-        # FIX: এখন module-level constant ব্যবহার করা হচ্ছে (_WS_ALERT_DEBOUNCE, _SIGNAL_ALERT_DEBOUNCE)
-        # এবং self._last_*_alert_time সঠিকভাবে update হচ্ছে
-        if not h.ws_alive:
+        ws_stale = (now - de._last_ws_message) > 30
+        if ws_stale:
+            health.ws_alive = False
             if (now - self._last_ws_alert_time) > _WS_ALERT_DEBOUNCE:
                 self._last_ws_alert_time = now
-                await self._send_alert("⚠️ WebSocket connection stale — data may be delayed")
-        elif not h.signals_flowing:
+                await self._send_alert(f"⚠️ WebSocket stale — last message {now - de._last_ws_message:.0f}s ago")
+
+        signal_stale = (now - self._last_signal_alert_time) > 3600
+        if signal_stale and m.total_signals > 0:
+            health.signals_flowing = False
             if (now - self._last_signal_alert_time) > _SIGNAL_ALERT_DEBOUNCE:
-                self._last_signal_alert_time = now
-                elapsed_h = (now - self._last_signal_time) / 3600
-                await self._send_alert(
-                    f"⚠️ No signals in {elapsed_h:.1f}h — check strategy conditions"
-                )
+                await self._send_alert(f"⚠️ No signals in {(now - self._last_signal_alert_time)/60:.0f} minutes")
 
-        # Circuit breaker state change → immediate Telegram alert
-        current_circuit = self._rm.metrics.circuit_state
-        if current_circuit != self._last_circuit_state:
-            self._last_circuit_state = current_circuit
-            if current_circuit != "OK":
-                reason = self._rm.metrics.circuit_reason
-                await self._send_alert(
-                    f"🚨 <b>CIRCUIT BREAKER: {current_circuit}</b>\n{reason}"
-                )
-
-        logger.debug(
-            f"Health: WS={'✅' if h.ws_alive else '❌'} "
-            f"Data={'✅' if h.data_fresh else '❌'} "
-            f"Signals={'✅' if h.signals_flowing else '⚠️'} "
-            f"Errors={h.error_count} "
-            f"Mem={h.memory_mb:.0f}MB "
-            f"Reconnects={h.ws_reconnects}"
-        )
-
-    # ─── Hourly Report ────────────────────────────────────────
+        if m.circuit_state == "HALT":
+            health.no_errors = False
+            await self._send_alert(f"🚨 CIRCUIT BREAKER: {m.circuit_state}\n{m.circuit_reason}")
 
     async def _report_loop(self) -> None:
-        # Wait until the next hour boundary
-        now = time.time()
-        next_hour = ((now // 3600) + 1) * 3600
-        await asyncio.sleep(next_hour - now)
-
         while not self._shutdown:
+            await asyncio.sleep(3600)
             try:
-                report = await self.build_hourly_report()
-                await self._send_alert(report)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.error(f"Report loop error:\n{traceback.format_exc()}")
-            await asyncio.sleep(_REPORT_INTERVAL)
+                await self._send_hourly_report()
+            except Exception as e:
+                logger.error(f"Hourly report error: {e}")
 
-    async def build_hourly_report(self) -> str:
-        """Build the hourly performance report string."""
-        now = datetime.now(timezone.utc)
+    async def _send_hourly_report(self) -> None:
         m = self._rm.metrics
-        h = self._health
-        ml = self._ml.stats
-
-        # Recent trades (last hour)
-        trades = await self._db.get_recent_trades(limit=50)
-        hour_cutoff = time.time() * 1000 - 3_600_000
-        hour_trades = [t for t in trades if t.get("timestamp", 0) > hour_cutoff]
-
-        # Strategy breakdown
-        strategy_stats = await self._db.get_strategy_stats()
-
-        # Top performers this session
-        best_trade = max(trades, key=lambda t: t.get("pnl", 0), default=None) if trades else None
-        worst_trade = min(trades, key=lambda t: t.get("pnl", 0), default=None) if trades else None
-
-        lines = [
-            f"📊 KAVACH-07 HOURLY — {now.strftime('%H:%M')} UTC",
-            "━" * 32,
-            "",
-            f"🎯 Signals: {m.total_signals} | Trades: {m.total_trades} | Wins: {m.winning_trades}",
-            f"📈 Win Rate: {m.win_rate*100:.0f}% | PF: {m.profit_factor:.2f}",
-            f"📉 Drawdown: {m.drawdown*100:.1f}% | Balance: ${m.balance:.2f}",
-            "",
-        ]
-
-        # Best/worst
-        if best_trade:
-            lines.append(
-                f"🔥 Best: {best_trade['symbol']} "
-                f"{best_trade['pnl']:+.2f} ({best_trade['strategy']})"
-            )
-        if worst_trade and worst_trade != best_trade:
-            lines.append(
-                f"❌ Worst: {worst_trade['symbol']} "
-                f"{worst_trade['pnl']:+.2f} ({worst_trade['strategy']})"
-            )
-
-        lines.append("")
-
-        # Strategy breakdown (top 3)
-        if strategy_stats:
-            lines.append("📊 Strategy Stats:")
-            for s in strategy_stats[:3]:
-                wr = s["wins"] / s["trades"] * 100 if s["trades"] > 0 else 0
-                lines.append(
-                    f"  {s['strategy']}: {s['trades']}t | "
-                    f"WR={wr:.0f}% | PnL={s['total_pnl']:+.2f}"
-                )
-            lines.append("")
-
-        # System health
-        ws_icon  = "✅" if h.ws_alive else "❌"
-        data_icon = "✅" if h.data_fresh else "❌"
-        ml_icon  = "✅" if ml["model_available"] else "❌"
-
-        lines += [
-            f"📡 WS: {ws_icon} | Data: {data_icon} | ML: {ml_icon}",
-            f"⚠️ Errors: {h.error_count} | "
-            f"Reconnects: {h.ws_reconnects} | "
-            f"Mem: {h.memory_mb:.0f}MB",
-            f"🤖 ML: {ml['samples_seen']} samples | "
-            f"ROC-AUC: {ml['roc_auc']:.3f} | "
-            f"Drift: {'Yes' if ml['drift_detections'] > 0 else 'No'}",
-            "",
-            f"⏳ Next Signal: Scanning...",
-        ]
-
-        # Circuit breaker warning
-        if m.circuit_state != "OK":
-            lines.insert(2, f"🚨 CIRCUIT: {m.circuit_state} — {m.circuit_reason}")
-
-        return "\n".join(lines)
-
-    async def build_status_message(self) -> str:
-        """Short status message for /status command."""
-        m = self._rm.metrics
-        h = self._health
-        now = datetime.now(timezone.utc)
-        uptime_h = h.uptime_seconds / 3600
-
-        return (
-            f"⚙️ KAVACH-07 STATUS — {now.strftime('%H:%M:%S')} UTC\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Balance: ${m.balance:.2f}\n"
-            f"📈 PnL: {m.total_pnl:+.2f} | Daily: {m.daily_pnl:+.2f}\n"
-            f"📉 Drawdown: {m.drawdown*100:.1f}%\n"
-            f"🔄 Trades: {m.total_trades} | WR: {m.win_rate*100:.0f}%\n"
-            f"📡 WS: {'✅' if h.ws_alive else '❌'} | "
-            f"Errors: {h.error_count}\n"
-            f"⏱️ Uptime: {uptime_h:.1f}h\n"
-            f"🔒 Circuit: {m.circuit_state}"
+        msg = (
+            f"📊 *Hourly Report*\n"
+            f"Balance: `${m.balance:.2f}`\n"
+            f"Daily P&L: `{m.daily_pnl:+.2f}`\n"
+            f"Drawdown: `{m.drawdown*100:.1f}%`\n"
+            f"Trades: {m.total_trades} | WR: `{m.win_rate*100:.0f}%`\n"
+            f"PF: `{m.profit_factor:.2f}` | Signals: {m.total_signals}"
         )
-
-    # ─── Midnight reset ───────────────────────────────────────
+        await self._send_alert(msg)
 
     async def _midnight_reset_loop(self) -> None:
-        """Reset daily metrics at UTC midnight."""
         while not self._shutdown:
-            now = time.time()
-            next_midnight = ((now // 86_400) + 1) * 86_400
-            await asyncio.sleep(next_midnight - now)
-            if not self._shutdown:
-                await self._rm.daily_reset()
-                logger.info("Daily reset executed at midnight UTC")
-
-    # ─── DB Cleanup ──────────────────────────────────────────
-
-    async def _cleanup_loop(self) -> None:
-        """Clean old data from DB daily."""
-        while not self._shutdown:
-            await asyncio.sleep(86_400)
+            now = datetime.now(timezone.utc)
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            seconds_to_midnight = (midnight - now).total_seconds()
+            await asyncio.sleep(seconds_to_midnight)
             try:
-                await self._db.cleanup_old_data(days=30)
-            except asyncio.CancelledError:
-                raise
+                await self._rm.daily_reset()
+                await self._send_alert("🌙 Daily reset complete")
             except Exception as e:
-                logger.warning(f"DB cleanup error: {e}")
-
-    # ─── Alert dispatch ───────────────────────────────────────
+                logger.error(f"Midnight reset error: {e}")
 
     async def _send_alert(self, message: str) -> None:
         for cb in self._on_alert_cbs:
             try:
                 asyncio.create_task(cb(message))
-            except Exception:
-                pass
+            except Exception as e:
+                # FIX: Log error instead of silent pass
+                logger.error(f"Failed to dispatch alert: {e}")
 
-    # ─── Accessors ───────────────────────────────────────────
+    def notify_signal(self) -> None:
+        self._last_signal_alert_time = time.time()
 
-    @property
-    def health(self) -> HealthStatus:
-        return self._health
+    def notify_ws_message(self) -> None:
+        pass
+
+    async def get_status_text(self) -> str:
+        m = self._rm.metrics
+        de = self._de
+        now = time.time()
+        ws_age = now - de._last_ws_message
+        return (
+            f"🛡️ *KAVACH-07 Status*\n"
+            f"WS: {'✅' if ws_age < 30 else '⚠️'} ({ws_age:.0f}s ago)\n"
+            f"Balance: `${m.balance:.2f}`\n"
+            f"Drawdown: `{m.drawdown*100:.1f}%`\n"
+            f"Circuit: `{m.circuit_state}`\n"
+            f"Paused: `{m.paused}`\n"
+            f"Signals: {m.total_signals} | Trades: {m.total_trades}"
+        )
+
+    async def get_balance_text(self) -> str:
+        m = self._rm.metrics
+        return (
+            f"💰 *Balance Report*\n"
+            f"Current: `${m.balance:.2f}`\n"
+            f"Peak: `${m.peak_balance:.2f}`\n"
+            f"Drawdown: `{m.drawdown*100:.1f}%`\n"
+            f"Daily P&L: `{m.daily_pnl:+.2f}`\n"
+            f"Total P&L: `{m.total_pnl:+.2f}`\n"
+            f"Win Rate: `{m.win_rate*100:.0f}%`\n"
+            f"Profit Factor: `{m.profit_factor:.2f}`"
+        )
+
+    async def get_positions_text(self) -> str:
+        return "📋 Positions: (not wired)"
