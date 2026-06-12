@@ -1,197 +1,171 @@
 """
 KAVACH-07 — ML Engine
-Online learning with river. Predicts signal success probability.
-Detects concept drift with ADWIN and resets model when detected.
-Zero overfitting: adapts continuously, predicts 0.5 until trained.
 """
 from __future__ import annotations
 
-import json
+import asyncio
+import hashlib
 import os
 import pickle
+import time
 import traceback
-from typing import Optional
+from typing import Dict, List, Optional
 
+from config import Config
+from models import Signal, TradeResult
 from utils import get_logger
 
 logger = get_logger(__name__)
 
 _MODEL_PATH = "ml_model.pkl"
-_MIN_SAMPLES = 100   # Predict 0.5 until this many labelled samples seen
-
+_MODEL_CHECKSUM_PATH = "ml_model.pkl.sha256"
 
 class MLEngine:
-    """
-    Online learning signal scorer using river library.
-    - Features: market snapshot + signal metadata
-    - Label: True if trade closed with PnL > 0
-    - Model: StandardScaler → LogisticRegression
-    - Drift: ADWIN detector — resets model on detected drift
-    """
 
-    def __init__(self, min_samples: int = _MIN_SAMPLES):
-        self._min_samples = min_samples
+    def __init__(self, config: Config):
+        self._cfg = config
+        self._model = None
+        self._scaler = None
         self._samples_seen = 0
         self._samples_trained = 0
-        self._drift_count = 0
-
-        self._model = None
         self._drift_detector = None
-        self._metric = None
+        self._is_trained = False
+        self._load_model()
 
-        self._load_or_init()
-
-    def _load_or_init(self) -> None:
-        """Load persisted model or init fresh."""
-        if os.path.exists(_MODEL_PATH):
-            try:
+    def _load_model(self) -> None:
+        try:
+            if os.path.exists(_MODEL_PATH) and os.path.exists(_MODEL_CHECKSUM_PATH):
+                with open(_MODEL_CHECKSUM_PATH, "r") as f:
+                    expected_checksum = f.read().strip()
+                with open(_MODEL_PATH, "rb") as f:
+                    actual_checksum = hashlib.sha256(f.read()).hexdigest()
+                if actual_checksum != expected_checksum:
+                    logger.warning("ML model checksum mismatch — starting fresh")
+                    self._init_model()
+                    return
                 with open(_MODEL_PATH, "rb") as f:
                     state = pickle.load(f)
-                self._model = state["model"]
-                self._drift_detector = state["drift"]
-                self._metric = state["metric"]
+                self._model = state.get("model")
+                self._scaler = state.get("scaler")
                 self._samples_seen = state.get("samples_seen", 0)
                 self._samples_trained = state.get("samples_trained", 0)
-                self._drift_count = state.get("drift_count", 0)
-                logger.info(
-                    f"ML model loaded: {self._samples_seen} samples, "
-                    f"{self._drift_count} drifts detected"
-                )
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load ML model: {e} — initialising fresh")
+                self._is_trained = state.get("is_trained", False)
+                logger.info(f"ML model loaded: {self._samples_trained} trained samples")
+            else:
+                self._init_model()
+        except Exception as e:
+            logger.error(f"ML model load error: {e}")
+            self._init_model()
 
-        self._init_fresh()
-
-    def _init_fresh(self) -> None:
-        """Initialise a new model pipeline."""
+    def _init_model(self) -> None:
         try:
-            from river import compose, preprocessing, linear_model, metrics, drift
-
+            from river import compose, preprocessing, tree, drift
+            self._scaler = preprocessing.StandardScaler()
             self._model = compose.Pipeline(
-                preprocessing.StandardScaler(),
-                linear_model.LogisticRegression(
-                    optimizer=None,      # uses Adam by default
-                    l2=0.01,
-                )
+                ("scale", self._scaler),
+                ("classifier", tree.HoeffdingAdaptiveTreeClassifier(
+                    grace_period=50,
+                    split_confidence=1e-5,
+                    drift_detector=drift.ADWIN(delta=0.002),
+                )),
             )
-            self._drift_detector = drift.ADWIN(delta=0.002)
-            self._metric = metrics.ROCAUC()
-            logger.info("ML model initialised fresh (river)")
-        except ImportError:
-            logger.warning("river library not installed — ML scoring disabled")
+            self._drift_detector = drift.ADWIN(delta=0.001)
+            logger.info("ML model initialized fresh")
+        except ImportError as e:
+            logger.error(f"river import failed: {e}")
             self._model = None
 
-    def predict(self, features: dict) -> float:
-        """
-        Predict P(win) for a trade setup.
-        Returns 0.5 if untrained.
-        """
-        if self._model is None or self._samples_seen < self._min_samples:
-            return 0.5
+    async def start(self) -> None:
+        logger.info("MLEngine started")
 
+    async def stop(self) -> None:
+        self._save()
+        logger.info("MLEngine stopped")
+
+    def predict(self, features: Dict[str, float]) -> float:
+        if not self._is_trained or self._model is None:
+            return 0.5
         try:
             proba = self._model.predict_proba_one(features)
-            return float(proba.get(True, 0.5))
-        except Exception:
-            logger.debug(f"ML predict error: {traceback.format_exc()}")
+            return proba.get(True, 0.5)
+        except Exception as e:
+            logger.warning(f"ML prediction error: {e}")
             return 0.5
 
-    def update(self, features: dict, win: bool) -> None:
-        """
-        Update model with a closed trade outcome.
-        win=True if trade was profitable.
-        """
-        self._samples_seen += 1
-
+    def update(self, features: Dict[str, float], result: TradeResult) -> None:
         if self._model is None:
             return
+        win = result.pnl > 0
+        self._samples_seen += 1
 
-        # Drift detection (track error)
-        if self._samples_seen >= self._min_samples:
+        if self._is_trained:
             try:
-                predicted_prob = self._model.predict_proba_one(features).get(True, 0.5)
-                prediction = predicted_prob > 0.5
-                error = 0.0 if (prediction == win) else 1.0
-                self._drift_detector.update(error)
-
-                if self._drift_detector.drift_detected:
-                    self._drift_count += 1
-                    logger.warning(
-                        f"ML drift detected (#{self._drift_count}) — resetting model"
-                    )
-                    self._init_fresh()
-                    self._samples_trained = 0
-                    self._save()
-                    return
-
-                # Update model
                 self._model.learn_one(features, win)
-                self._metric.update(win, predicted_prob)
                 self._samples_trained += 1
-
-                # Periodic save
-                if self._samples_trained % 50 == 0:
-                    self._save()
-                    logger.debug(
-                        f"ML updated: {self._samples_trained} samples, "
-                        f"ROC-AUC: {self._metric.get():.3f}"
-                    )
             except Exception:
-                logger.debug(f"ML update error: {traceback.format_exc()}")
-        else:
-            # Pre-training: still accumulate (learn without predicting)
+                logger.warning(f"ML online learn failed:\n{traceback.format_exc()}")
             try:
-                self._model.learn_one(features, win)
-                self._samples_trained += 1
+                prediction = self._model.predict_one(features)
+                if prediction is not None:
+                    self._drift_detector.update(int(prediction == win))
+                    if self._drift_detector.drift_detected:
+                        logger.warning("ML drift detected — model may need retraining")
             except Exception:
                 pass
+        else:
+            try:
+                self._model.learn_one(features, win)
+                self._samples_trained += 1
+            except Exception:
+                logger.warning(f"ML pre-training learn failed:\n{traceback.format_exc()}")
+                self._samples_seen -= 1
+                return
+            if self._samples_trained >= 100:
+                self._is_trained = True
+                logger.info(f"ML model trained on {self._samples_trained} samples")
 
     def _save(self) -> None:
-        """Persist model to disk."""
         if self._model is None:
             return
         try:
             state = {
                 "model": self._model,
-                "drift": self._drift_detector,
-                "metric": self._metric,
+                "scaler": self._scaler,
                 "samples_seen": self._samples_seen,
                 "samples_trained": self._samples_trained,
-                "drift_count": self._drift_count,
+                "is_trained": self._is_trained,
             }
-            with open(_MODEL_PATH + ".tmp", "wb") as f:
+            tmp_path = _MODEL_PATH + ".tmp"
+            with open(tmp_path, "wb") as f:
                 pickle.dump(state, f)
-            os.replace(_MODEL_PATH + ".tmp", _MODEL_PATH)
+            with open(tmp_path, "rb") as f:
+                checksum = hashlib.sha256(f.read()).hexdigest()
+            os.replace(tmp_path, _MODEL_PATH)
+            with open(_MODEL_CHECKSUM_PATH, "w") as f:
+                f.write(checksum)
+            logger.info(f"ML model saved ({self._samples_trained} samples)")
         except Exception as e:
-            logger.warning(f"ML model save failed: {e}")
+            logger.error(f"ML model save error: {e}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
-    @property
-    def is_trained(self) -> bool:
-        return self._samples_seen >= self._min_samples
-
-    @property
-    def stats(self) -> dict:
-        roc = 0.0
-        if self._metric:
-            try:
-                roc = self._metric.get()
-            except Exception:
-                pass
+    @staticmethod
+    def build_features(signal: Signal, data: "DataSnapshot") -> Dict[str, float]:
         return {
-            "samples_seen": self._samples_seen,
-            "samples_trained": self._samples_trained,
-            "drift_detections": self._drift_count,
-            "is_trained": self.is_trained,
-            "roc_auc": round(roc, 4),
-            "model_available": self._model is not None,
+            "confidence": signal.confidence,
+            "risk_pct": signal.risk_pct,
+            "atr_pct": signal.atr / signal.entry_price if signal.entry_price > 0 else 0,
+            "r_ratio": signal.r_ratio,
+            "sl_distance_pct": signal.sl_distance_pct,
+            "funding_percentile": data.funding_percentile,
+            "oi_change_1h": data.oi_change_1h,
+            "oi_change_4h": data.oi_change_4h,
+            "cvd_z_score": data.cvd_z_score,
+            "cvd_slope_5m": data.cvd_slope_5m,
+            "ob_imbalance": data.ob_imbalance,
+            "spread_pct": data.spread_pct,
+            "volume_ratio": data.volume_ratio,
+            "basis_pct": data.basis_pct,
+            "hour": signal.timestamp.hour,
+            "day_of_week": signal.timestamp.weekday(),
         }
-
-    @property
-    def drift_detected(self) -> bool:
-        if self._drift_detector is None:
-            return False
-        try:
-            return bool(self._drift_detector.drift_detected)
-        except Exception:
-            return False
