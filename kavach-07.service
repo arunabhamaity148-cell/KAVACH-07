@@ -1,40 +1,20 @@
 [Unit]
-Description=KAVACH-07 Futures Signal Bot
-Documentation=https://github.com/arunabhamaity148-cell/KAVACH-07
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=5
+Description=KAVACH-07 Crypto Futures Signal Bot
+After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-Group=ubuntu
+# FIX: Changed from ubuntu to kavach to match install.sh
+User=kavach
+Group=kavach
 WorkingDirectory=/opt/kavach-07
-Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/kavach-07
 EnvironmentFile=/opt/kavach-07/.env
-
-ExecStartPre=/opt/kavach-07/venv/bin/python -c "from config import get_config; get_config().validate(); print('Config OK')"
-ExecStart=/opt/kavach-07/venv/bin/python main.py
-
-# Auto-restart on failure
-Restart=on-failure
-RestartSec=30s
-
-# Limits
-LimitNOFILE=65536
-LimitNPROC=4096
-
-# Security hardening
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/opt/kavach-07 /var/log
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=kavach-07
+ExecStart=/opt/kavach-07/venv/bin/python -m main
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/kavach-07.log
+StandardError=append:/var/log/kavach-07.log
 
 [Install]
 WantedBy=multi-user.target
