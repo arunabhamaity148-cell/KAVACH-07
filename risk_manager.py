@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from config import Config
@@ -18,16 +18,17 @@ from utils import get_logger
 logger = get_logger(__name__)
 
 # Circuit breaker states
-_CB_OK = "OK"
+_CB_OK     = "OK"
 _CB_REDUCE = "REDUCE"
-_CB_HALT = "HALT"
+_CB_HALT   = "HALT"
 
 # Drawdown adjustments
 _DD_LEVELS = [
-    (0.05, 0.75),  # 5% DD → 75% size
-    (0.10, 0.50),  # 10% DD → 50% size
-    (0.15, 0.00),  # 15% DD → HALT
+    (0.05, 0.75),   # 5% DD → 75% size
+    (0.10, 0.50),   # 10% DD → 50% size
+    (0.15, 0.00),   # 15% DD → HALT
 ]
+
 
 class RiskManager:
 
@@ -39,10 +40,9 @@ class RiskManager:
             peak_balance=config.INITIAL_BALANCE,
             daily_start_balance=config.INITIAL_BALANCE,
         )
-        self._open_exposure: float = 0.0  # Sum of reserved risk for open positions
+        self._open_exposure: float = 0.0   # Sum of (risk_pct × balance) for open positions
         self._lock = asyncio.Lock()
         self._save_task: Optional[asyncio.Task] = None
-        self._on_halt_cb = None  # Callable for circuit breaker Telegram alerts
 
     # ─── Lifecycle ───────────────────────────────────────────
 
@@ -51,23 +51,22 @@ class RiskManager:
         row = await self._db.load_risk_metrics()
         if row:
             m = self._metrics
-            m.balance = float(row.get("balance", m.balance))
-            m.peak_balance = float(row.get("peak_balance", m.peak_balance))
-            m.total_pnl = float(row.get("total_pnl", 0))
-            m.gross_profit = float(row.get("gross_profit", 0))
-            m.gross_loss = float(row.get("gross_loss", 0))
-            m.total_trades = int(row.get("total_trades", 0))
-            m.winning_trades = int(row.get("winning_trades", 0))
-            m.losing_trades = int(row.get("losing_trades", 0))
-            m.consecutive_losses = int(row.get("consecutive_losses", 0))
-            m.consecutive_wins = int(row.get("consecutive_wins", 0))
-            m.total_signals = int(row.get("total_signals", 0))
-            m.daily_pnl = float(row.get("daily_pnl", 0))
-            m.daily_start_balance = float(row.get("daily_start_balance", m.balance))
-            m.circuit_state = row.get("circuit_state", _CB_OK)
-            m.circuit_reason = row.get("circuit_reason", "")
-            m.halt_until = row.get("halt_until")
-            m.paused = bool(row.get("paused", 0))
+            m.balance              = float(row.get("balance", m.balance))
+            m.peak_balance         = float(row.get("peak_balance", m.peak_balance))
+            m.total_pnl            = float(row.get("total_pnl", 0))
+            m.gross_profit         = float(row.get("gross_profit", 0))
+            m.gross_loss           = float(row.get("gross_loss", 0))
+            m.total_trades         = int(row.get("total_trades", 0))
+            m.winning_trades       = int(row.get("winning_trades", 0))
+            m.losing_trades        = int(row.get("losing_trades", 0))
+            m.consecutive_losses   = int(row.get("consecutive_losses", 0))
+            m.consecutive_wins     = int(row.get("consecutive_wins", 0))
+            m.total_signals        = int(row.get("total_signals", 0))
+            m.daily_pnl            = float(row.get("daily_pnl", 0))
+            m.daily_start_balance  = float(row.get("daily_start_balance", m.balance))
+            m.circuit_state        = row.get("circuit_state", _CB_OK)
+            m.circuit_reason       = row.get("circuit_reason", "")
+            m.halt_until           = row.get("halt_until")
 
             # Recalculate drawdown
             if m.peak_balance > 0:
@@ -94,67 +93,65 @@ class RiskManager:
 
     # ─── Position Sizing ─────────────────────────────────────
 
-    async def calculate_size(self, signal: Signal) -> Tuple[float, str]:
+    def calculate_size(self, signal: Signal) -> Tuple[float, str]:
         """
         Returns (size_in_base_asset, rejection_reason).
         size=0 means rejected.
         """
-        async with self._lock:
-            m = self._metrics
+        m = self._metrics
 
-            # ── Circuit breaker check ─────────────────────────────
-            if m.circuit_state == _CB_HALT:
-                if m.halt_until and time.time() < m.halt_until:
-                    remaining = int(m.halt_until - time.time())
-                    return 0.0, f"HALTED for {remaining}s: {m.circuit_reason}"
-                else:
-                    # Auto-resume after halt expires
-                    m.circuit_state = _CB_OK
-                    m.circuit_reason = ""
-                    m.halt_until = None
-                    logger.info("Circuit breaker auto-resumed after halt period")
+        # ── Circuit breaker check ─────────────────────────────
+        if m.circuit_state == _CB_HALT:
+            if m.halt_until and time.time() < m.halt_until:
+                remaining = int(m.halt_until - time.time())
+                return 0.0, f"HALTED for {remaining}s: {m.circuit_reason}"
+            else:
+                # Auto-resume after halt expires
+                m.circuit_state = _CB_OK
+                m.circuit_reason = ""
+                m.halt_until = None
+                logger.info("Circuit breaker auto-resumed after halt period")
 
-            if m.paused:
-                return 0.0, "System paused"
+        if m.paused:
+            return 0.0, "System paused"
 
-            # ── Maximum total exposure check ──────────────────────
-            risk_amount = m.balance * signal.risk_pct
-            if (self._open_exposure + risk_amount) > (m.balance * self._cfg.MAX_TOTAL_EXPOSURE):
-                return 0.0, f"Total exposure limit reached ({self._cfg.MAX_TOTAL_EXPOSURE*100:.1f}%)"
+        # ── Maximum total exposure check ──────────────────────
+        risk_amount = m.balance * signal.risk_pct
+        if (self._open_exposure + risk_amount) > (m.balance * self._cfg.MAX_TOTAL_EXPOSURE):
+            return 0.0, f"Total exposure limit reached ({self._cfg.MAX_TOTAL_EXPOSURE*100:.1f}%)"
 
-            # ── Base size calculation ─────────────────────────────
-            sl_distance = abs(signal.entry_price - signal.sl_price)
-            if sl_distance < 1e-10:
-                return 0.0, "SL distance too small"
+        # ── Base size calculation ─────────────────────────────
+        sl_distance = abs(signal.entry_price - signal.sl_price)
+        if sl_distance < 1e-10:
+            return 0.0, "SL distance too small"
 
-            base_risk = m.balance * signal.risk_pct
-            raw_size = base_risk / sl_distance
+        base_risk = m.balance * signal.risk_pct
+        raw_size = base_risk / sl_distance
 
-            # ── Drawdown adjustment ───────────────────────────────
-            dd_mult = self._drawdown_multiplier(m.drawdown)
-            if dd_mult <= 0:
-                return 0.0, f"Drawdown too deep: {m.drawdown*100:.1f}%"
+        # ── Drawdown adjustment ───────────────────────────────
+        dd_mult = self._drawdown_multiplier(m.drawdown)
+        if dd_mult <= 0:
+            return 0.0, f"Drawdown too deep: {m.drawdown*100:.1f}%"
 
-            # ── Circuit breaker size reduction ────────────────────
-            cb_mult = 0.5 if m.circuit_state == _CB_REDUCE else 1.0
+        # ── Circuit breaker size reduction ────────────────────
+        cb_mult = 0.5 if m.circuit_state == _CB_REDUCE else 1.0
 
-            # ── ATR volatility adjustment ─────────────────────────
-            atr_pct = signal.atr / signal.entry_price if signal.entry_price > 0 else 0
-            atr_mult = max(0.5, min(1.5, 0.01 / max(atr_pct, 0.001)))
+        # ── ATR volatility adjustment ─────────────────────────
+        # Higher ATR → already reflected in wider SL → size naturally reduces
+        # Additional vol adjustment: cap size if ATR is extreme
+        atr_pct = signal.atr / signal.entry_price if signal.entry_price > 0 else 0
+        atr_mult = max(0.5, min(1.5, 0.01 / max(atr_pct, 0.001)))  # target 1% ATR
 
-            final_size = raw_size * dd_mult * cb_mult * atr_mult
+        final_size = raw_size * dd_mult * cb_mult
 
-            # Sanity cap: never risk more than MAX_RISK_PER_TRADE
-            max_risk_size = (m.balance * self._cfg.MAX_RISK_PER_TRADE) / sl_distance
-            final_size = min(final_size, max_risk_size)
+        # Sanity cap: never risk more than MAX_RISK_PER_TRADE regardless of adjustments
+        max_risk_size = (m.balance * self._cfg.MAX_RISK_PER_TRADE) / sl_distance
+        final_size = min(final_size, max_risk_size)
 
-            if final_size < 1e-8:
-                return 0.0, "Calculated size too small"
+        if final_size < 1e-8:
+            return 0.0, "Calculated size too small"
 
-            # FIX: Reserve exposure synchronously before returning
-            self._open_exposure += risk_amount
-
-            return round(final_size, 6), ""
+        return round(final_size, 6), ""
 
     def _drawdown_multiplier(self, drawdown: float) -> float:
         for threshold, multiplier in sorted(_DD_LEVELS, key=lambda x: x[0], reverse=True):
@@ -165,10 +162,13 @@ class RiskManager:
     # ─── Position lifecycle callbacks ─────────────────────────
 
     def on_position_opened(self, pos: Position) -> None:
-        """Reserve exposure when position opens — now handled in calculate_size()."""
-        # FIX: Exposure is reserved synchronously in calculate_size()
-        # This method is kept for compatibility but does nothing
-        pass
+        """Reserve exposure when position opens."""
+        async def _inner():
+            async with self._lock:
+                risk = self._metrics.balance * (pos.confidence * self._cfg.MAX_RISK_PER_TRADE)
+                self._open_exposure += risk
+
+        asyncio.create_task(_inner())
 
     async def on_trade_closed(self, result: TradeResult) -> None:
         """Update balance and metrics when trade closes."""
@@ -185,8 +185,7 @@ class RiskManager:
                 m.consecutive_wins += 1
             else:
                 m.losing_trades += 1
-                # FIX: Store absolute value for gross_loss
-                m.gross_loss += abs(result.pnl)
+                m.gross_loss += result.pnl
                 m.consecutive_wins = 0
                 m.consecutive_losses += 1
 
@@ -197,8 +196,9 @@ class RiskManager:
                 m.peak_balance = m.balance
             m.drawdown = max(0.0, (m.peak_balance - m.balance) / m.peak_balance)
 
-            # FIX: Release exposure using reserved_risk from TradeResult
-            self._open_exposure = max(0.0, self._open_exposure - result.reserved_risk)
+            # Release exposure
+            risk_estimate = abs(result.entry_price - result.exit_price) * result.size
+            self._open_exposure = max(0.0, self._open_exposure - risk_estimate)
 
             # Run circuit breakers
             self._run_circuit_breakers()
@@ -206,12 +206,12 @@ class RiskManager:
             # Save to DB immediately on trade close
             await self._db.save_risk_metrics(m)
 
-            logger.info(
-                f"Balance: ${m.balance:.2f} | "
-                f"PnL: {result.pnl:+.2f} | "
-                f"Drawdown: {m.drawdown*100:.1f}% | "
-                f"WR: {m.win_rate*100:.0f}% ({m.total_trades} trades)"
-            )
+        logger.info(
+            f"Balance: ${m.balance:.2f} | "
+            f"PnL: {result.pnl:+.2f} | "
+            f"Drawdown: {m.drawdown*100:.1f}% | "
+            f"WR: {m.win_rate*100:.0f}% ({m.total_trades} trades)"
+        )
 
     def increment_signals(self) -> None:
         self._metrics.total_signals += 1
@@ -269,7 +269,7 @@ class RiskManager:
                 logger.info("Circuit breaker REDUCE cleared")
 
     def _trigger_halt(self, reason: str, duration_s: float = 0,
-                      until: Optional[float] = None) -> None:
+                       until: Optional[float] = None) -> None:
         m = self._metrics
         if until is None:
             until = time.time() + duration_s
@@ -278,20 +278,15 @@ class RiskManager:
         m.halt_until = until
         hours = (until - time.time()) / 3600
         logger.critical(f"CIRCUIT BREAKER HALT: {reason} | Duration: {hours:.1f}h")
-        # Fire Telegram alert if wired
-        if self._on_halt_cb:
-            asyncio.create_task(self._on_halt_cb(_CB_HALT, reason))
-
-    def register_halt_callback(self, cb) -> None:
-        """Register a coroutine callback (state, reason) for circuit breaker events."""
-        self._on_halt_cb = cb
 
     @staticmethod
     def _next_midnight() -> float:
         """UTC timestamp of next midnight."""
         now = datetime.now(timezone.utc)
-        today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return (today_midnight + timedelta(days=1)).timestamp()
+        tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if tomorrow <= now:
+            tomorrow = tomorrow.replace(day=tomorrow.day + 1)
+        return tomorrow.timestamp()
 
     # ─── Daily reset ─────────────────────────────────────────
 
@@ -300,7 +295,7 @@ class RiskManager:
         async with self._lock:
             self._metrics.daily_start_balance = self._metrics.balance
             self._metrics.daily_pnl = 0.0
-            logger.info(f"Daily reset — new start balance: ${self._metrics.balance:.2f}")
+        logger.info(f"Daily reset — new start balance: ${self._metrics.balance:.2f}")
 
     # ─── Persistence ─────────────────────────────────────────
 
@@ -325,20 +320,12 @@ class RiskManager:
     def resume(self) -> None:
         m = self._metrics
         m.paused = False
-        # FIX: Don't clear deep drawdown halt without warning
+        # Also clear soft halts when resuming
         if m.circuit_state == _CB_HALT:
-            if m.drawdown >= self._cfg.DRAWDOWN_HALT_THRESHOLD:
-                logger.critical(
-                    f"⚠️ RESUME REQUEST DENIED: Deep drawdown halt active. "
-                    f"Current drawdown={m.drawdown*100:.1f}%. "
-                    f"Use /resume_confirm within 30s to force override."
-                )
-                # Keep halt active — require explicit confirmation
-                return
             m.circuit_state = _CB_OK
             m.circuit_reason = ""
             m.halt_until = None
-            logger.info("Trading resumed by command")
+        logger.info("Trading resumed by command")
 
     def halt(self) -> None:
         self._trigger_halt("Emergency halt by operator", duration_s=86_400 * 7)
@@ -353,7 +340,6 @@ class RiskManager:
     def balance(self) -> float:
         return self._metrics.balance
 
-    # FIX: is_halted no longer mutates state — use separate async method
     @property
     def is_halted(self) -> bool:
         m = self._metrics
@@ -361,17 +347,7 @@ class RiskManager:
             return True
         if m.circuit_state == _CB_HALT:
             if m.halt_until and time.time() > m.halt_until:
-                # Halt expired — but DON'T mutate here
+                m.circuit_state = _CB_OK
                 return False
             return True
         return False
-
-    async def check_and_clear_expired_halt(self) -> None:
-        """Async method to clear expired halts with proper locking."""
-        async with self._lock:
-            m = self._metrics
-            if m.circuit_state == _CB_HALT and m.halt_until and time.time() > m.halt_until:
-                m.circuit_state = _CB_OK
-                m.circuit_reason = ""
-                m.halt_until = None
-                logger.info("Circuit breaker auto-resumed after halt period expired")
