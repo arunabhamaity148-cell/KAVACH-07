@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Any
 
+
 # ─────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────
@@ -16,8 +17,10 @@ from typing import Optional, Dict, List, Any
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _new_id() -> str:
     return str(uuid.uuid4())[:12]
+
 
 # ─────────────────────────────────────────────────────────────
 # Market Data
@@ -39,11 +42,12 @@ class Candle:
     taker_buy_base: float = 0.0
     is_closed: bool = True
 
+
 @dataclass
 class OrderbookSnapshot:
     symbol: str
     timestamp: datetime
-    bids: List[List[float]] = field(default_factory=list)  # [[price, qty], ...]
+    bids: List[List[float]] = field(default_factory=list)   # [[price, qty], ...]
     asks: List[List[float]] = field(default_factory=list)
 
     @property
@@ -69,6 +73,7 @@ class OrderbookSnapshot:
             return 1.0
         return bid_vol / ask_vol
 
+
 @dataclass
 class FundingData:
     symbol: str
@@ -84,12 +89,14 @@ class FundingData:
             return 0.0
         return (self.mark_price - self.index_price) / self.index_price
 
+
 @dataclass
 class OpenInterestData:
     symbol: str
     open_interest: float
     open_interest_value: float
     timestamp: datetime = field(default_factory=_utcnow)
+
 
 # ─────────────────────────────────────────────────────────────
 # Signal
@@ -99,9 +106,9 @@ class OpenInterestData:
 class Signal:
     symbol: str
     strategy: str
-    direction: str  # LONG or SHORT
-    confidence: float  # 0.0–1.0
-    entry_type: str  # LIMIT or MARKET
+    direction: str          # LONG or SHORT
+    confidence: float       # 0.0–1.0
+    entry_type: str         # LIMIT or MARKET
     entry_price: float
     sl_price: float
     tp1_price: float
@@ -147,6 +154,7 @@ class Signal:
             "timestamp": self.timestamp.isoformat(),
         }
 
+
 # ─────────────────────────────────────────────────────────────
 # Position
 # ─────────────────────────────────────────────────────────────
@@ -164,7 +172,7 @@ class Position:
     open_time: datetime
     strategy: str
     confidence: float
-    status: str  # OPEN | TP1_HIT | TP2_HIT | SL_HIT | EXPIRED | CLOSED
+    status: str         # OPEN | TP1_HIT | TP2_HIT | SL_HIT | EXPIRED | CLOSED
     pnl: float = 0.0
     unrealized_pnl: float = 0.0
     close_time: Optional[datetime] = None
@@ -174,13 +182,10 @@ class Position:
     max_favorable_excursion: float = 0.0
     max_adverse_excursion: float = 0.0
     expiry: Optional[datetime] = None
-    # FIX: Store original reserved risk for accurate exposure tracking
-    reserved_risk: float = 0.0
 
     @property
     def is_open(self) -> bool:
-        # FIX: Include TP1_HIT positions in open check
-        return self.status in ("OPEN", "TP1_HIT")
+        return self.status == "OPEN"
 
     def calc_unrealized_pnl(self, current_price: float) -> float:
         if self.direction == "LONG":
@@ -206,8 +211,8 @@ class Position:
             "close_time": self.close_time.isoformat() if self.close_time else None,
             "close_price": self.close_price,
             "expiry": self.expiry.isoformat() if self.expiry else None,
-            "reserved_risk": self.reserved_risk,
         }
+
 
 # ─────────────────────────────────────────────────────────────
 # DataSnapshot — complete market state for one symbol
@@ -230,11 +235,11 @@ class DataSnapshot:
 
     # Trade flow / CVD
     cvd: float = 0.0
-    cvd_z_score: float = 0.0  # z-score relative to recent history
-    cvd_slope_5m: float = 0.0  # normalised linear slope
+    cvd_z_score: float = 0.0        # z-score relative to recent history
+    cvd_slope_5m: float = 0.0       # normalised linear slope
     cvd_slope_15m: float = 0.0
-    delta_1m: float = 0.0  # net delta in last 1m window
-    delta_direction: int = 0  # +1 buy, -1 sell, 0 neutral
+    delta_1m: float = 0.0           # net delta in last 1m window
+    delta_direction: int = 0        # +1 buy, -1 sell, 0 neutral
 
     # Funding & OI
     mark_price: float = 0.0
@@ -282,20 +287,12 @@ class DataSnapshot:
             return (self.bids[0][0] + self.asks[0][0]) / 2
         return 0.0
 
-    # FIX: Add best_ask and best_bid properties for strategies
-    @property
-    def best_ask(self) -> float:
-        return self.asks[0][0] if self.asks else 0.0
-
-    @property
-    def best_bid(self) -> float:
-        return self.bids[0][0] if self.bids else 0.0
-
     @property
     def basis_pct(self) -> float:
         if self.index_price < 1e-10:
             return 0.0
         return (self.mark_price - self.index_price) / self.index_price
+
 
 # ─────────────────────────────────────────────────────────────
 # Regime
@@ -303,7 +300,7 @@ class DataSnapshot:
 
 @dataclass
 class RegimeSignal:
-    bias: str  # BULLISH | BEARISH | NEUTRAL
+    bias: str           # BULLISH | BEARISH | NEUTRAL
     confidence: float
     btc_flow: float = 0.0
     eth_flow: float = 0.0
@@ -311,6 +308,7 @@ class RegimeSignal:
     oi_trend: float = 0.0
     position_multiplier: float = 1.0
     timestamp: datetime = field(default_factory=_utcnow)
+
 
 # ─────────────────────────────────────────────────────────────
 # System Health
@@ -334,6 +332,7 @@ class HealthStatus:
     def all_healthy(self) -> bool:
         return all([self.ws_alive, self.data_fresh, self.signals_flowing, self.no_errors])
 
+
 # ─────────────────────────────────────────────────────────────
 # Risk & Metrics
 # ─────────────────────────────────────────────────────────────
@@ -354,7 +353,7 @@ class RiskMetrics:
     total_pnl: float = 0.0
     gross_profit: float = 0.0
     gross_loss: float = 0.0
-    circuit_state: str = "OK"  # OK | REDUCE | HALT
+    circuit_state: str = "OK"   # OK | REDUCE | HALT
     circuit_reason: str = ""
     paused: bool = False
     halt_until: Optional[float] = None
@@ -369,7 +368,7 @@ class RiskMetrics:
     def profit_factor(self) -> float:
         if abs(self.gross_loss) < 1e-10:
             return 999.0 if self.gross_profit > 0 else 0.0
-        return self.gross_profit / self.gross_loss
+        return self.gross_profit / abs(self.gross_loss)
 
     def to_dict(self) -> dict:
         return {
@@ -387,6 +386,7 @@ class RiskMetrics:
             "paused": self.paused,
         }
 
+
 @dataclass
 class TradeResult:
     position_id: str
@@ -397,13 +397,11 @@ class TradeResult:
     exit_price: float
     size: float
     pnl: float
-    exit_reason: str  # TP1 | TP2 | SL | EXPIRED | MANUAL
+    exit_reason: str        # TP1 | TP2 | SL | EXPIRED | MANUAL
     duration_seconds: float
     r_multiple: float
     confidence: float = 0.0
     timestamp: datetime = field(default_factory=_utcnow)
-    # FIX: Store original reserved risk for accurate exposure tracking
-    reserved_risk: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -420,5 +418,4 @@ class TradeResult:
             "r_multiple": round(self.r_multiple, 2),
             "confidence": round(self.confidence, 4),
             "timestamp": self.timestamp.isoformat(),
-            "reserved_risk": self.reserved_risk,
         }
