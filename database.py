@@ -1,430 +1,305 @@
 """
-KAVACH-07 — Database
-SQLite schema, async queries, state persistence.
+KAVACH-07 — Database Layer
+Async SQLite with WAL mode, migrations, and all CRUD operations.
 """
 from __future__ import annotations
 
-import json
-import logging
-import uuid
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
-
 import aiosqlite
+import json
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from models import Signal, Position, TradeResult, RiskMetrics
+from config import Config
+from models import Candle, Position, RiskMetrics, Signal, TradeResult
 from utils import get_logger
-
-
-DB_PATH = "kavach07.db"
 
 logger = get_logger(__name__)
 
-# ─────────────────────────────────────────────────────────────
-# Schema
-# ─────────────────────────────────────────────────────────────
-
-SCHEMA_VERSION = 1
-
-_DDL = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA foreign_keys=ON;
-
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS candles (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol      TEXT    NOT NULL,
-    interval    TEXT    NOT NULL,
-    open_time   INTEGER NOT NULL,
-    open        REAL    NOT NULL,
-    high        REAL    NOT NULL,
-    low         REAL    NOT NULL,
-    close       REAL    NOT NULL,
-    volume      REAL    NOT NULL,
-    quote_vol   REAL    DEFAULT 0,
-    num_trades  INTEGER DEFAULT 0,
-    UNIQUE(symbol, interval, open_time)
-);
-CREATE INDEX IF NOT EXISTS idx_candles_sym_int ON candles(symbol, interval, open_time DESC);
-
-CREATE TABLE IF NOT EXISTS funding_rates (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol       TEXT    NOT NULL,
-    funding_rate REAL    NOT NULL,
-    funding_time INTEGER NOT NULL,
-    mark_price   REAL    NOT NULL,
-    index_price  REAL    NOT NULL,
-    recorded_at  INTEGER NOT NULL,
-    UNIQUE(symbol, funding_time)
-);
-CREATE INDEX IF NOT EXISTS idx_funding_sym ON funding_rates(symbol, funding_time DESC);
-
-CREATE TABLE IF NOT EXISTS open_interest (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol     TEXT NOT NULL,
-    oi         REAL NOT NULL,
-    oi_value   REAL NOT NULL,
-    recorded_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_oi_sym ON open_interest(symbol, recorded_at DESC);
-
-CREATE TABLE IF NOT EXISTS signals (
-    id           TEXT    PRIMARY KEY,
-    symbol       TEXT    NOT NULL,
-    strategy     TEXT    NOT NULL,
-    direction    TEXT    NOT NULL,
-    confidence   REAL    NOT NULL,
-    ml_score     REAL    NOT NULL,
-    entry_type   TEXT    NOT NULL,
-    entry_price  REAL    NOT NULL,
-    sl_price     REAL    NOT NULL,
-    tp1_price    REAL    NOT NULL,
-    tp2_price    REAL,
-    risk_pct     REAL    NOT NULL,
-    r_ratio      REAL    NOT NULL,
-    atr          REAL    NOT NULL,
-    rationale    TEXT    NOT NULL,
-    timestamp    INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(timestamp DESC);
-
-CREATE TABLE IF NOT EXISTS positions (
-    id            TEXT    PRIMARY KEY,
-    symbol        TEXT    NOT NULL,
-    direction     TEXT    NOT NULL,
-    entry_price   REAL    NOT NULL,
-    size          REAL    NOT NULL,
-    sl_price      REAL    NOT NULL,
-    tp1_price     REAL    NOT NULL,
-    tp2_price     REAL,
-    open_time     INTEGER NOT NULL,
-    strategy      TEXT    NOT NULL,
-    confidence    REAL    NOT NULL,
-    status        TEXT    NOT NULL DEFAULT 'OPEN',
-    pnl           REAL    DEFAULT 0,
-    close_time    INTEGER,
-    close_price   REAL,
-    tp1_hit       INTEGER DEFAULT 0,
-    expiry        INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
-
-CREATE TABLE IF NOT EXISTS trade_results (
-    id                TEXT    PRIMARY KEY,
-    position_id       TEXT    NOT NULL,
-    symbol            TEXT    NOT NULL,
-    strategy          TEXT    NOT NULL,
-    direction         TEXT    NOT NULL,
-    entry_price       REAL    NOT NULL,
-    exit_price        REAL    NOT NULL,
-    size              REAL    NOT NULL,
-    pnl               REAL    NOT NULL,
-    exit_reason       TEXT    NOT NULL,
-    duration_seconds  REAL    NOT NULL,
-    r_multiple        REAL    NOT NULL,
-    confidence        REAL    NOT NULL,
-    timestamp         INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_trades_ts ON trade_results(timestamp DESC);
-
-CREATE TABLE IF NOT EXISTS risk_state (
-    id                   INTEGER PRIMARY KEY DEFAULT 1,
-    balance              REAL    NOT NULL DEFAULT 1000.0,
-    peak_balance         REAL    NOT NULL DEFAULT 1000.0,
-    total_pnl            REAL    NOT NULL DEFAULT 0,
-    gross_profit         REAL    NOT NULL DEFAULT 0,
-    gross_loss           REAL    NOT NULL DEFAULT 0,
-    total_trades         INTEGER NOT NULL DEFAULT 0,
-    winning_trades       INTEGER NOT NULL DEFAULT 0,
-    losing_trades        INTEGER NOT NULL DEFAULT 0,
-    consecutive_losses   INTEGER NOT NULL DEFAULT 0,
-    consecutive_wins     INTEGER NOT NULL DEFAULT 0,
-    total_signals        INTEGER NOT NULL DEFAULT 0,
-    daily_pnl            REAL    NOT NULL DEFAULT 0,
-    daily_start_balance  REAL    NOT NULL DEFAULT 1000.0,
-    circuit_state        TEXT    NOT NULL DEFAULT 'OK',
-    circuit_reason       TEXT    NOT NULL DEFAULT '',
-    halt_until           REAL,
-    paused               INTEGER NOT NULL DEFAULT 0,
-    updated_at           INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS error_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    component   TEXT    NOT NULL,
-    message     TEXT    NOT NULL,
-    traceback   TEXT,
-    recorded_at INTEGER NOT NULL
-);
-"""
-
-
-# ─────────────────────────────────────────────────────────────
-# Database class
-# ─────────────────────────────────────────────────────────────
-
-def _ts() -> int:
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
-
-
 class Database:
-    def __init__(self, path: str = DB_PATH):
-        self._path = path
+
+    def __init__(self, config: Config):
+        self._cfg = config
         self._db: Optional[aiosqlite.Connection] = None
+        self._last_commit_time = time.time()
 
     async def connect(self) -> None:
-        self._db = await aiosqlite.connect(self._path)
+        self._db = await aiosqlite.connect(self._cfg.DB_PATH)
         self._db.row_factory = aiosqlite.Row
-        await self._db.executescript(_DDL)
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA cache_size=-64000")
+        # FIX: Auto-checkpoint to prevent WAL file growth
+        await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         await self._migrate()
-        await self._db.commit()
-        logger.info(f"Database connected: {self._path}")
+        logger.info(f"Database connected: {self._cfg.DB_PATH}")
 
     async def close(self) -> None:
         if self._db:
             await self._db.close()
-            self._db = None
+            logger.info("Database closed")
 
     async def _migrate(self) -> None:
-        async with self._db.execute("SELECT version FROM schema_version LIMIT 1") as cur:  # type: ignore
-            row = await cur.fetchone()
-        if row is None:
-            await self._db.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
-            await self._db.execute(
-                "INSERT OR IGNORE INTO risk_state (id) VALUES (1)"
-            )
-        # Live migrations: add columns that may not exist in older DBs
-        try:
-            await self._db.execute(  # type: ignore
-                "ALTER TABLE risk_state ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
-            )
-        except Exception:
-            pass  # Column already exists — fine
+        await self._db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS candles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL, interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL, open REAL, high REAL, low REAL,
+                close REAL, volume REAL, close_time INTEGER,
+                quote_volume REAL, num_trades INTEGER, taker_buy_base REAL,
+                UNIQUE(symbol, interval, open_time)
+            );
+            CREATE INDEX IF NOT EXISTS idx_candles_sym_tf ON candles(symbol, interval, open_time DESC);
 
-    # ─── Candles ─────────────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS signals (
+                id TEXT PRIMARY KEY, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+                direction TEXT NOT NULL, confidence REAL, entry_type TEXT,
+                entry_price REAL, sl_price REAL, tp1_price REAL, tp2_price REAL,
+                risk_pct REAL, r_ratio REAL, atr REAL, ml_score REAL,
+                rationale TEXT, timestamp INTEGER, filters TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(timestamp DESC);
 
-    async def upsert_candle(self, c: dict) -> None:
-        await self._db.execute(  # type: ignore
-            """INSERT OR REPLACE INTO candles
-               (symbol, interval, open_time, open, high, low, close, volume, quote_vol, num_trades)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (c["symbol"], c["interval"], int(c["open_time"]), float(c["open"]),
-             float(c["high"]), float(c["low"]), float(c["close"]), float(c["volume"]),
-             float(c.get("quote_volume", 0)), int(c.get("num_trades", 0))),
+            CREATE TABLE IF NOT EXISTS positions (
+                id TEXT PRIMARY KEY, symbol TEXT NOT NULL, direction TEXT NOT NULL,
+                entry_price REAL, size REAL, sl_price REAL, tp1_price REAL,
+                tp2_price REAL, open_time INTEGER, strategy TEXT, confidence REAL,
+                status TEXT, pnl REAL DEFAULT 0, close_time INTEGER,
+                close_price REAL, tp1_hit INTEGER DEFAULT 0, expiry INTEGER,
+                reserved_risk REAL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, position_id TEXT,
+                symbol TEXT, strategy TEXT, direction TEXT, entry_price REAL,
+                exit_price REAL, size REAL, pnl REAL, exit_reason TEXT,
+                duration_seconds REAL, r_multiple REAL, confidence REAL,
+                close_time INTEGER, reserved_risk REAL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(close_time DESC);
+
+            CREATE TABLE IF NOT EXISTS risk_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1), balance REAL,
+                peak_balance REAL, total_pnl REAL, gross_profit REAL,
+                gross_loss REAL, total_trades INTEGER, winning_trades INTEGER,
+                losing_trades INTEGER, consecutive_losses INTEGER,
+                consecutive_wins INTEGER, total_signals INTEGER, daily_pnl REAL,
+                daily_start_balance REAL, circuit_state TEXT, circuit_reason TEXT,
+                halt_until REAL, paused INTEGER, updated_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS health_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER,
+                ws_alive INTEGER, data_fresh INTEGER, signals_flowing INTEGER,
+                no_errors INTEGER, error_count INTEGER, ws_reconnects INTEGER,
+                uptime_seconds REAL, memory_mb REAL
+            );
+            """
         )
-        await self._db.commit()  # type: ignore
+        await self._db.commit()
 
-    async def get_candles(self, symbol: str, interval: str, limit: int = 300) -> List[dict]:
-        async with self._db.execute(  # type: ignore
+        # FIX: Specific exception handling for migration
+        try:
+            await self._db.execute("ALTER TABLE risk_state ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass  # Column already exists — expected
+        except Exception as e:
+            logger.error(f"Migration error: {e}")
+            raise
+
+    async def insert_candle(self, candle: Candle) -> None:
+        await self._db.execute(
+            """INSERT INTO candles(symbol, interval, open_time, open, high, low, close,
+                volume, close_time, quote_volume, num_trades, taker_buy_base)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, interval, open_time) DO UPDATE SET
+                open=excluded.open, high=excluded.high, low=excluded.low,
+                close=excluded.close, volume=excluded.volume,
+                close_time=excluded.close_time, quote_volume=excluded.quote_volume,
+                num_trades=excluded.num_trades, taker_buy_base=excluded.taker_buy_base""",
+            (candle.symbol, candle.interval, int(candle.open_time.timestamp() * 1000),
+             candle.open, candle.high, candle.low, candle.close, candle.volume,
+             int(candle.close_time.timestamp() * 1000), candle.quote_volume,
+             candle.num_trades, candle.taker_buy_base),
+        )
+        await self._maybe_commit()
+
+    async def get_candles(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
+        async with self._db.execute(
             "SELECT * FROM candles WHERE symbol=? AND interval=? ORDER BY open_time DESC LIMIT ?",
             (symbol, interval, limit),
         ) as cur:
             rows = await cur.fetchall()
-        return [dict(r) for r in reversed(rows)]
+            return [dict(r) for r in reversed(rows)]
 
-    # ─── Funding ─────────────────────────────────────────────
-
-    async def upsert_funding(self, symbol: str, rate: float, fund_time: int,
-                              mark: float, index: float) -> None:
-        await self._db.execute(  # type: ignore
-            """INSERT OR IGNORE INTO funding_rates
-               (symbol, funding_rate, funding_time, mark_price, index_price, recorded_at)
-               VALUES (?,?,?,?,?,?)""",
-            (symbol, rate, fund_time, mark, index, _ts()),
+    async def insert_signal(self, signal: Signal) -> None:
+        await self._db.execute(
+            """INSERT INTO signals(id, symbol, strategy, direction, confidence,
+                entry_type, entry_price, sl_price, tp1_price, tp2_price,
+                risk_pct, r_ratio, atr, ml_score, rationale, timestamp, filters)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (signal.id, signal.symbol, signal.strategy, signal.direction,
+             signal.confidence, signal.entry_type, signal.entry_price,
+             signal.sl_price, signal.tp1_price, signal.tp2_price,
+             signal.risk_pct, signal.r_ratio, signal.atr,
+             signal.ml_score, signal.rationale,
+             int(signal.timestamp.timestamp() * 1000),
+             json.dumps(signal.filters_passed)),
         )
-        await self._db.commit()  # type: ignore
+        await self._maybe_commit()
 
-    async def get_funding_history(self, symbol: str, limit: int = 360) -> List[float]:
-        """Returns list of funding rates ordered by time ascending."""
-        async with self._db.execute(  # type: ignore
-            "SELECT funding_rate FROM funding_rates WHERE symbol=? ORDER BY funding_time DESC LIMIT ?",
-            (symbol, limit),
+    async def get_recent_signals(self, limit: int = 20) -> List[Dict]:
+        async with self._db.execute(
+            "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,),
         ) as cur:
             rows = await cur.fetchall()
-        return [float(r["funding_rate"]) for r in reversed(rows)]
+            return [dict(r) for r in rows]
 
-    # ─── OI ──────────────────────────────────────────────────
-
-    async def insert_oi(self, symbol: str, oi: float, oi_value: float) -> None:
-        await self._db.execute(  # type: ignore
-            "INSERT INTO open_interest (symbol, oi, oi_value, recorded_at) VALUES (?,?,?,?)",
-            (symbol, oi, oi_value, _ts()),
-        )
-        await self._db.commit()  # type: ignore
-
-    async def get_oi_history(self, symbol: str, limit: int = 300) -> List[tuple]:
-        """Returns list of (oi, recorded_at) ordered ascending."""
-        async with self._db.execute(  # type: ignore
-            "SELECT oi, recorded_at FROM open_interest WHERE symbol=? ORDER BY recorded_at DESC LIMIT ?",
-            (symbol, limit),
-        ) as cur:
-            rows = await cur.fetchall()
-        return [(float(r["oi"]), int(r["recorded_at"])) for r in reversed(rows)]
-
-    # ─── Signals ─────────────────────────────────────────────
-
-    async def insert_signal(self, sig: Signal) -> None:
-        await self._db.execute(  # type: ignore
-            """INSERT OR IGNORE INTO signals
-               (id, symbol, strategy, direction, confidence, ml_score, entry_type,
-                entry_price, sl_price, tp1_price, tp2_price, risk_pct, r_ratio, atr,
-                rationale, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (sig.id, sig.symbol, sig.strategy, sig.direction, sig.confidence,
-             sig.ml_score, sig.entry_type, sig.entry_price, sig.sl_price,
-             sig.tp1_price, sig.tp2_price, sig.risk_pct, sig.r_ratio, sig.atr,
-             sig.rationale, _ts()),
-        )
-        await self._db.commit()  # type: ignore
-
-    async def get_recent_signals(self, limit: int = 20) -> List[dict]:
-        async with self._db.execute(  # type: ignore
-            "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in rows]
-
-    async def signal_exists_recently(self, symbol: str, strategy: str, window_ms: int = 180_000) -> bool:
-        """True if same symbol+strategy signal fired in last window_ms milliseconds."""
-        cutoff = _ts() - window_ms
-        async with self._db.execute(  # type: ignore
-            "SELECT 1 FROM signals WHERE symbol=? AND strategy=? AND timestamp>? LIMIT 1",
-            (symbol, strategy, cutoff),
+    async def signal_exists(self, symbol: str, strategy: str, since_ms: int) -> bool:
+        async with self._db.execute(
+            "SELECT 1 FROM signals WHERE symbol=? AND strategy=? AND timestamp > ? LIMIT 1",
+            (symbol, strategy, since_ms),
         ) as cur:
             return await cur.fetchone() is not None
 
-    # ─── Positions ───────────────────────────────────────────
-
     async def insert_position(self, pos: Position) -> None:
-        expiry_ts = int(pos.expiry.timestamp() * 1000) if pos.expiry else None
-        await self._db.execute(  # type: ignore
-            """INSERT OR IGNORE INTO positions
-               (id, symbol, direction, entry_price, size, sl_price, tp1_price, tp2_price,
-                open_time, strategy, confidence, status, pnl, expiry)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        await self._db.execute(
+            """INSERT INTO positions(id, symbol, direction, entry_price, size,
+                sl_price, tp1_price, tp2_price, open_time, strategy, confidence,
+                status, pnl, expiry, reserved_risk)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (pos.id, pos.symbol, pos.direction, pos.entry_price, pos.size,
              pos.sl_price, pos.tp1_price, pos.tp2_price,
              int(pos.open_time.timestamp() * 1000),
-             pos.strategy, pos.confidence, pos.status, pos.pnl, expiry_ts),
+             pos.strategy, pos.confidence, pos.status, pos.pnl,
+             int(pos.expiry.timestamp() * 1000) if pos.expiry else None,
+             pos.reserved_risk),
         )
-        await self._db.commit()  # type: ignore
+        await self._maybe_commit()
 
     async def update_position(self, pos: Position) -> None:
-        close_ts = int(pos.close_time.timestamp() * 1000) if pos.close_time else None
-        await self._db.execute(  # type: ignore
-            """UPDATE positions SET status=?, pnl=?, close_time=?, close_price=?, tp1_hit=?
-               WHERE id=?""",
-            (pos.status, pos.pnl, close_ts, pos.close_price, int(pos.tp1_hit), pos.id),
+        # FIX: Save updated sl_price and size after partial close
+        await self._db.execute(
+            """UPDATE positions SET
+                status = ?, pnl = ?, close_time = ?, close_price = ?,
+                tp1_hit = ?, sl_price = ?, size = ?, reserved_risk = ?
+            WHERE id = ?""",
+            (pos.status, pos.pnl,
+             int(pos.close_time.timestamp() * 1000) if pos.close_time else None,
+             pos.close_price, int(pos.tp1_hit), pos.sl_price, pos.size,
+             pos.reserved_risk, pos.id),
         )
-        await self._db.commit()  # type: ignore
+        await self._maybe_commit()
 
-    async def get_open_positions(self) -> List[dict]:
-        async with self._db.execute(  # type: ignore
-            "SELECT * FROM positions WHERE status='OPEN'"
+    async def get_open_positions(self) -> List[Dict]:
+        # FIX: Include TP1_HIT positions
+        async with self._db.execute(
+            "SELECT * FROM positions WHERE status IN ('OPEN', 'TP1_HIT')"
         ) as cur:
             rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+            return [dict(r) for r in rows]
 
-    async def get_recent_positions(self, limit: int = 10) -> List[dict]:
-        async with self._db.execute(  # type: ignore
-            "SELECT * FROM positions ORDER BY open_time DESC LIMIT ?", (limit,)
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in rows]
-
-    # ─── Trade Results ────────────────────────────────────────
-
-    async def insert_trade_result(self, tr: TradeResult) -> None:
-        await self._db.execute(  # type: ignore
-            """INSERT OR IGNORE INTO trade_results
-               (id, position_id, symbol, strategy, direction, entry_price, exit_price,
-                size, pnl, exit_reason, duration_seconds, r_multiple, confidence, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(uuid.uuid4()), tr.position_id, tr.symbol, tr.strategy,
-             tr.direction, tr.entry_price, tr.exit_price, tr.size, tr.pnl,
-             tr.exit_reason, tr.duration_seconds, tr.r_multiple, tr.confidence, _ts()),
+    async def insert_trade_result(self, result: TradeResult) -> None:
+        await self._db.execute(
+            """INSERT INTO trades(position_id, symbol, strategy, direction,
+                entry_price, exit_price, size, pnl, exit_reason,
+                duration_seconds, r_multiple, confidence, close_time, reserved_risk)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (result.position_id, result.symbol, result.strategy, result.direction,
+             result.entry_price, result.exit_price, result.size, result.pnl,
+             result.exit_reason, result.duration_seconds, result.r_multiple,
+             result.confidence, int(result.timestamp.timestamp() * 1000),
+             result.reserved_risk),
         )
-        await self._db.commit()  # type: ignore
+        await self._maybe_commit()
 
-    async def get_recent_trades(self, limit: int = 20) -> List[dict]:
-        async with self._db.execute(  # type: ignore
-            "SELECT * FROM trade_results ORDER BY timestamp DESC LIMIT ?", (limit,)
+    async def get_recent_trades(self, limit: int = 20) -> List[Dict]:
+        async with self._db.execute(
+            "SELECT * FROM trades ORDER BY close_time DESC LIMIT ?", (limit,),
         ) as cur:
             rows = await cur.fetchall()
-        return [dict(r) for r in rows]
+            return [dict(r) for r in rows]
 
-    async def get_strategy_stats(self) -> List[dict]:
-        async with self._db.execute(  # type: ignore
-            """SELECT strategy,
-                      COUNT(*) as trades,
-                      SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins,
-                      SUM(pnl) as total_pnl,
-                      AVG(r_multiple) as avg_r
-               FROM trade_results
-               GROUP BY strategy
-               ORDER BY total_pnl DESC"""
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in rows]
-
-    # ─── Risk State ───────────────────────────────────────────
-
-    async def save_risk_metrics(self, m: RiskMetrics) -> None:
-        await self._db.execute(  # type: ignore
-            """INSERT OR REPLACE INTO risk_state
-               (id, balance, peak_balance, total_pnl, gross_profit, gross_loss,
-                total_trades, winning_trades, losing_trades, consecutive_losses,
-                consecutive_wins, total_signals, daily_pnl, daily_start_balance,
-                circuit_state, circuit_reason, halt_until, paused, updated_at)
-               VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (m.balance, m.peak_balance, m.total_pnl, m.gross_profit, m.gross_loss,
-             m.total_trades, m.winning_trades, m.losing_trades, m.consecutive_losses,
-             m.consecutive_wins, m.total_signals, m.daily_pnl, m.daily_start_balance,
-             m.circuit_state, m.circuit_reason, m.halt_until, int(m.paused), _ts()),
-        )
-        await self._db.commit()  # type: ignore
-
-    async def load_risk_metrics(self) -> Optional[dict]:
-        async with self._db.execute(  # type: ignore
-            "SELECT * FROM risk_state WHERE id=1"
+    async def get_trade_stats(self) -> Dict[str, Any]:
+        async with self._db.execute(
+            """SELECT COUNT(*) as total,
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
+                SUM(pnl) as total_pnl, AVG(pnl) as avg_pnl,
+                AVG(CASE WHEN pnl > 0 THEN pnl END) as avg_win,
+                AVG(CASE WHEN pnl < 0 THEN pnl END) as avg_loss,
+                AVG(r_multiple) as avg_r FROM trades"""
         ) as cur:
             row = await cur.fetchone()
-        return dict(row) if row else None
+            return dict(row) if row else {}
 
-    # ─── Error Log ────────────────────────────────────────────
+    async def save_risk_metrics(self, metrics: RiskMetrics) -> None:
+        await self._db.execute(
+            """INSERT INTO risk_state(id, balance, peak_balance, total_pnl,
+                gross_profit, gross_loss, total_trades, winning_trades,
+                losing_trades, consecutive_losses, consecutive_wins,
+                total_signals, daily_pnl, daily_start_balance, circuit_state,
+                circuit_reason, halt_until, paused, updated_at)
+            VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                balance=excluded.balance, peak_balance=excluded.peak_balance,
+                total_pnl=excluded.total_pnl, gross_profit=excluded.gross_profit,
+                gross_loss=excluded.gross_loss, total_trades=excluded.total_trades,
+                winning_trades=excluded.winning_trades,
+                losing_trades=excluded.losing_trades,
+                consecutive_losses=excluded.consecutive_losses,
+                consecutive_wins=excluded.consecutive_wins,
+                total_signals=excluded.total_signals,
+                daily_pnl=excluded.daily_pnl,
+                daily_start_balance=excluded.daily_start_balance,
+                circuit_state=excluded.circuit_state,
+                circuit_reason=excluded.circuit_reason,
+                halt_until=excluded.halt_until, paused=excluded.paused,
+                updated_at=excluded.updated_at""",
+            (metrics.balance, metrics.peak_balance, metrics.total_pnl,
+             metrics.gross_profit, metrics.gross_loss, metrics.total_trades,
+             metrics.winning_trades, metrics.losing_trades,
+             metrics.consecutive_losses, metrics.consecutive_wins,
+             metrics.total_signals, metrics.daily_pnl, metrics.daily_start_balance,
+             metrics.circuit_state, metrics.circuit_reason,
+             metrics.halt_until, int(metrics.paused), int(time.time())),
+            ),
+        )
+        await self._maybe_commit()
 
-    async def log_error(self, component: str, message: str, tb: str = "") -> None:
-        try:
-            await self._db.execute(  # type: ignore
-                "INSERT INTO error_log (component, message, traceback, recorded_at) VALUES (?,?,?,?)",
-                (component, message[:500], tb[:2000], _ts()),
-            )
-            await self._db.commit()  # type: ignore
-        except Exception:
-            pass  # Never crash on error logging
+    async def load_risk_metrics(self) -> Optional[Dict]:
+        async with self._db.execute("SELECT * FROM risk_state WHERE id = 1") as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
 
-    # ─── Cleanup (prevent unbounded growth) ──────────────────
+    async def insert_health_log(self, health: Dict[str, Any]) -> None:
+        await self._db.execute(
+            """INSERT INTO health_log(timestamp, ws_alive, data_fresh,
+                signals_flowing, no_errors, error_count, ws_reconnects,
+                uptime_seconds, memory_mb)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (int(time.time()), int(health.get("ws_alive", 0)),
+             int(health.get("data_fresh", 0)),
+             int(health.get("signals_flowing", 0)),
+             int(health.get("no_errors", 0)),
+             health.get("error_count", 0),
+             health.get("ws_reconnects", 0),
+             health.get("uptime_seconds", 0.0),
+             health.get("memory_mb", 0.0)),
+        )
+        await self._maybe_commit()
 
-    async def cleanup_old_data(self, days: int = 30) -> None:
-        cutoff = _ts() - days * 86_400_000
-        # Each table uses its actual timestamp column name
-        await self._db.execute(  # type: ignore
-            "DELETE FROM candles WHERE open_time < ?", (cutoff,)
-        )
-        await self._db.execute(  # type: ignore
-            "DELETE FROM signals WHERE timestamp < ?", (cutoff,)
-        )
-        await self._db.execute(  # type: ignore
-            "DELETE FROM error_log WHERE recorded_at < ?", (cutoff,)
-        )
-        # OI: keep last 50000 rows per symbol
-        await self._db.execute(  # type: ignore
-            """DELETE FROM open_interest WHERE id NOT IN (
-               SELECT id FROM open_interest ORDER BY recorded_at DESC LIMIT 50000)"""
-        )
-        await self._db.commit()  # type: ignore
-        logger.debug("Old data cleaned up")
+    # FIX: Batch commits every 1 second instead of every insert
+    async def _maybe_commit(self) -> None:
+        now = time.time()
+        if now - self._last_commit_time >= 1.0:
+            await self._db.commit()
+            self._last_commit_time = now
+
+    async def commit(self) -> None:
+        if self._db:
+            await self._db.commit()
+            self._last_commit_time = time.time()
