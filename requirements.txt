@@ -1,27 +1,37 @@
-# KAVACH-07 Dependencies — All Free, Open-Source
-# Install: pip install -r requirements.txt --break-system-packages
+# KAVACH-07 Dependencies
+# Python 3.9+ required
+# Install: pip install -r requirements.txt
 
-# WebSocket & HTTP
-websockets>=12.0,<13.0
-aiohttp>=3.9.5,<4.0.0
+# Async HTTP & WebSocket
+aiohttp>=3.9.5
+websockets>=12.0
+httpx>=0.27.0
 
-# Async SQLite
-aiosqlite>=0.20.0,<1.0.0
+# Telegram Bot
+python-telegram-bot[job-queue]>=21.0
 
-# Telegram Bot (async)
-python-telegram-bot>=20.7,<22.0
-
-# Online Machine Learning
-river>=0.21.0,<1.0.0
-
-# Numerical / Data
-numpy>=1.26.0,<2.0.0
-pandas>=2.2.0,<3.0.0
-scipy>=1.13.0,<2.0.0
+# Database
+aiosqlite>=0.20.0
 
 # Configuration
-python-dotenv>=1.0.1,<2.0.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
 
-# Utilities
-python-dateutil>=2.9.0
-ujson>=5.9.0       # Fast JSON parsing for WS messages
+# Data & Math
+numpy>=1.26.4
+pandas>=2.2.0
+
+# Technical Analysis (pure Python, no C deps)
+pandas-ta>=0.3.14b0
+
+# Terminal UI
+rich>=13.7.0
+
+# Timezone
+pytz>=2024.1
+
+# HTTP (sync fallback)
+requests>=2.31.0
+
+# Type checking support
+typing-extensions>=4.9.0
