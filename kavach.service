@@ -1,0 +1,30 @@
+[Unit]
+Description=KAVACH-07 Crypto Futures Signal Bot
+After=network.target
+
+[Service]
+# Environment setup
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kavach
+Environment="PYTHONPATH=/home/ubuntu/kavach"
+
+# Execution
+ExecStart=/home/ubuntu/kavach/venv/bin/python kavach/main.py
+
+# Restart policy for production stability
+Restart=always
+RestartSec=10
+
+# Resource management for Oracle Cloud Free Tier (1GB RAM)
+CPUAccounting=true
+MemoryAccounting=true
+MemoryHigh=800M
+MemoryMax=900M
+
+# Logging
+StandardOutput=append:/home/ubuntu/kavach/logs/service.log
+StandardError=append:/home/ubuntu/kavach/logs/service.log
+
+[Install]
+WantedBy=multi-user.target
