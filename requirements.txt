@@ -1,37 +1,13 @@
-# KAVACH-07 Dependencies
-# Python 3.9+ required
-# Install: pip install -r requirements.txt
-
-# Async HTTP & WebSocket
 aiohttp>=3.9.5
 websockets>=12.0
-httpx>=0.27.0
-
-# Telegram Bot
-python-telegram-bot[job-queue]>=21.0
-
-# Database
+python-telegram-bot[job-queue]>=21.3
 aiosqlite>=0.20.0
-
-# Configuration
 pyyaml>=6.0.1
-python-dotenv>=1.0.0
-
-# Data & Math
+python-dotenv>=1.0.1
 numpy>=1.26.4
-pandas>=2.2.0
-
-# Technical Analysis (pure Python, no C deps)
-pandas-ta>=0.3.14b0
-
-# Terminal UI
-rich>=13.7.0
-
-# Timezone
+pandas>=2.2.2
+rich>=13.7.1
 pytz>=2024.1
-
-# HTTP (sync fallback)
-requests>=2.31.0
-
-# Type checking support
-typing-extensions>=4.9.0
+openai>=1.33.0
+eth-account>=0.11.2
+typing-extensions>=4.11.0
