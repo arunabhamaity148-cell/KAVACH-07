@@ -55,4 +55,4 @@ CREATE TABLE IF NOT EXISTS logs (
 -- Indices for performance --
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_close_ts ON trades(close_timestamp);
-CREATE INDEX IF NOT EXISTS idx_market_data_sym_ts O
+CREATE INDEX IF NOT EXISTS idx_market_data_sym_ts ON market_data(symbol, timestamp);
