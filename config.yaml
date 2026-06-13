@@ -196,7 +196,7 @@ risk:
     - "DASHUSDT"
     - "SCRT"
     - "DUSK"
-    - "BEAMGUSDT"
+    - "BEAMUSDT" # FIXED: Bug #6 corrected BEAMGUSDT -> BEAMUSDT
   correlation_groups:
     - ["BTCUSDT", "ETHUSDT"]
     - ["SOLUSDT", "AVAXUSDT"]
@@ -209,9 +209,7 @@ phase2:
     emergency_score_threshold: -7.0
     pause_duration_minutes: 60
     poll_interval_seconds: 120
-    # Primary API (Paid/Optional)
-    crypto_panic_api_key: ""
-    # Free Fallback Sources (Bug #8 remediation)
+    # FREE RSS sources only as per requirement
     rss_feeds:
       - "https://feeds.feedburner.com/CoinDesk"
       - "https://cointelegraph.com/rss"
